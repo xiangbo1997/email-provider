@@ -22,6 +22,29 @@ pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
+容器部署：
+
+```bash
+cp .env.example .env
+docker compose up -d --build
+```
+
+安全部署建议：
+
+- 服务默认没有公网访问控制，部署时必须配置 `EMAIL_PROVIDER_API_KEY`
+- 生产环境建议只监听 `127.0.0.1`
+- OpenAPI 文档默认关闭，只有设置 `EMAIL_PROVIDER_EXPOSE_DOCS=1` 才会暴露
+
+鉴权方式：
+
+- `Authorization: Bearer <EMAIL_PROVIDER_API_KEY>`
+- 或 `X-API-Key: <EMAIL_PROVIDER_API_KEY>`
+
+健康检查：
+
+- `GET /healthz` 无鉴权，供容器或进程探活
+- `GET /api/mailbox-service/health` 需要鉴权
+
 默认接口：
 
 - `GET /`

@@ -114,6 +114,14 @@ MAILBOX_SERVICE_DATABASE_URL=sqlite:///mailbox_service.db
 
 也可以改成其他 SQLAlchemy/SQLModel 支持的数据库 URL。
 
+部署时建议至少设置：
+
+```bash
+EMAIL_PROVIDER_API_KEY=your-long-random-secret
+EMAIL_PROVIDER_EXPOSE_DOCS=0
+MAILBOX_SERVICE_DATABASE_URL=sqlite:////runtime/mailbox_service.db
+```
+
 ## 5. 推荐接入方式
 
 ### 5.1 首选：HTTP API
@@ -166,6 +174,11 @@ MAILBOX_SERVICE_DATABASE_URL=sqlite:///mailbox_service.db
   "database_url": "sqlite:///mailbox_service.db"
 }
 ```
+
+说明：
+
+- `/api/mailbox-service/health` 需要 API Key。
+- 进程探活请使用无鉴权的 `GET /healthz`。
 
 ### 6.2 列出 provider
 
@@ -393,6 +406,17 @@ MAILBOX_SERVICE_DATABASE_URL=sqlite:///mailbox_service.db
 }
 ```
 
+鉴权失败时会返回：
+
+```json
+{
+  "detail": {
+    "code": "UNAUTHORIZED",
+    "message": "missing or invalid API key"
+  }
+}
+```
+
 ### 6.8 完成会话
 
 `POST /api/mailbox-service/sessions/{session_id}/complete`
@@ -598,13 +622,13 @@ MAILBOX_SERVICE_DATABASE_URL=sqlite:///mailbox_service.db
 
 ## 11. 安全与部署建议
 
-### 11.1 当前实现没有内建鉴权
+### 11.1 当前实现采用 API Key 鉴权
 
 因此：
 
-- 不要把服务直接裸露到公网。
-- 推荐只部署在内网。
-- 或者挂在已有 API 网关后面做鉴权、限流、审计。
+- 调用方必须通过 `Authorization: Bearer <token>` 或 `X-API-Key: <token>` 访问 `/api/mailbox-service/*`。
+- 仍然不要把服务直接裸露到公网。
+- 推荐只部署在内网，或挂在已有 API 网关后面继续做限流、审计。
 
 ### 11.2 数据库是敏感资产
 

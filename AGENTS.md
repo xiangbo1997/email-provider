@@ -22,6 +22,11 @@
 
 当前推荐把这个仓库当成 HTTP 服务来接，不要让业务项目直接依赖各个 provider 类。
 
+部署时必须配置 API Key。所有 `/api/mailbox-service/*` 路由都需要：
+
+- `Authorization: Bearer <EMAIL_PROVIDER_API_KEY>`
+- 或 `X-API-Key: <EMAIL_PROVIDER_API_KEY>`
+
 固定 API 路径：
 
 - `GET /api/mailbox-service/health`
@@ -75,9 +80,9 @@
 
 ## Security Constraints
 
-- 当前 HTTP API 没有内建鉴权，不要直接暴露到公网。
+- 当前版本已经支持 API Key 鉴权，但仍然不应该直接裸露到公网。
 - provider 配置会写入会话表，数据库里可能包含上游 token、账号、代理等敏感信息。
-- 推荐部署在内网，或放到带鉴权的 API 网关后面。
+- 推荐只监听 `127.0.0.1`，并放到内网或带鉴权的 API 网关后面。
 
 ## Deployment Recommendation
 

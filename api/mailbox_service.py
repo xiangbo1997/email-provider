@@ -1,12 +1,17 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from api.security import verify_api_key
 from services.mailbox_service import MailboxServiceError, mailbox_service
 
 
-router = APIRouter(prefix="/mailbox-service", tags=["mailbox-service"])
+router = APIRouter(
+    prefix="/mailbox-service",
+    tags=["mailbox-service"],
+    dependencies=[Depends(verify_api_key)],
+)
 
 
 class CreateMailboxSessionRequest(BaseModel):
