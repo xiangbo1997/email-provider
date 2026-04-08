@@ -18,6 +18,7 @@
 当前仓库是第一阶段拆分结果：
 
 - 已经可以独立启动成一个 FastAPI 服务。
+- 已经带最小可用的管理后台。
 - 已经支持主项目中的 ChatGPT / Kiro 类 OTP 场景。
 - 仍然保留 Python 进程内兼容层，方便旧代码平滑迁移。
 
@@ -27,10 +28,14 @@
   FastAPI 入口，启动时初始化数据库。
 - `api/mailbox_service.py`
   HTTP 接口定义，当前固定 API 契约在这里。
+- `api/admin.py`
+  provider 配置管理 API。
 - `services/mailbox_service.py`
-  会话状态机、租约、持久化、错误码映射。
+  会话状态机、租约、provider 配置持久化、错误码映射。
 - `core/base_mailbox.py`
   provider 抽象、各 provider 实现、兼容层 `MailboxServiceBackedMailbox`。
+- `static/admin/`
+  管理后台页面资源。
 - `core/applemail_diagnostics.py`
   AppleMail 收信诊断客户端。
 - `scripts/applemail_diagnose.py`
@@ -67,7 +72,21 @@ provider 是具体邮箱来源，例如：
 - 当前状态
 - 异常码和异常信息
 
-### 3.3 Lease Token
+### 3.3 Saved Provider Config
+
+现在支持把 provider 配置持久化保存，供多个会话复用。
+
+一个保存的 provider 配置包含：
+
+- 名称
+- provider 名称
+- 是否启用
+- 代理
+- 描述
+- `extra` 配置
+- 最近一次校验结果
+
+### 3.4 Lease Token
 
 `lease_token` 是操作某个 session 的租约令牌。`poll-code` 和 `complete` 都依赖它。
 
@@ -77,11 +96,11 @@ provider 是具体邮箱来源，例如：
 - 不要打印到业务日志。
 - 不要自己伪造或缓存复用其他任务的 `lease_token`。
 
-### 3.4 before_ids
+### 3.5 before_ids
 
 `before_ids` 是创建 session 时抓取到的“已有邮件 id 列表”。轮询验证码时要带回去，用来过滤旧邮件，避免误读上一轮任务的验证码。
 
-### 3.5 provider_meta
+### 3.6 provider_meta
 
 `provider_meta` 是 provider 透出的补充上下文，常见字段：
 
@@ -134,6 +153,8 @@ MAILBOX_SERVICE_DATABASE_URL=sqlite:////runtime/mailbox_service.db
 - provider 内部字段和类实现后续仍可能演进。
 - 业务项目不需要和 provider 内部强绑定。
 
+如果是人工维护 provider 配置，推荐直接使用管理后台 `/admin`。
+
 ### 5.2 次选：Python 兼容层
 
 如果你在一个 Python 项目里，需要兼容旧的 `BaseMailbox` 调用面，可以使用：
@@ -154,6 +175,15 @@ MAILBOX_SERVICE_DATABASE_URL=sqlite:////runtime/mailbox_service.db
 - `/api/mailbox-service/sessions/{session_id}`
 - `/api/mailbox-service/sessions/{session_id}/poll-code`
 - `/api/mailbox-service/sessions/{session_id}/complete`
+- `/api/admin/provider-catalog`
+- `/api/admin/provider-configs`
+- `/api/admin/provider-configs/{id}`
+- `/api/admin/provider-configs/{id}/validate`
+- `/api/admin/recent-sessions`
+
+另外还有管理页面：
+
+- `/admin`
 
 ### 6.1 健康检查
 
@@ -232,6 +262,8 @@ MAILBOX_SERVICE_DATABASE_URL=sqlite:////runtime/mailbox_service.db
 请求体字段：
 
 - `provider`: provider 名称，必填。
+- `config_id`: 保存的 provider 配置 id，选填。
+- `config_name`: 保存的 provider 配置名称，选填。
 - `purpose`: 业务目的，选填，默认 `generic`。
 - `proxy`: 代理地址，选填。
 - `extra`: provider 配置，选填。
@@ -314,6 +346,30 @@ MAILBOX_SERVICE_DATABASE_URL=sqlite:////runtime/mailbox_service.db
 - `session_id` 是服务层 id。
 - `account_id` 是 provider 层账号 id。
 - 在兼容层里，旧代码看到的 `account_id` 可能会被替换成 `session_id`，不要把两个概念混用。
+
+#### 模式 C：直接复用保存配置
+
+如果你已经在管理后台或管理 API 里保存了 provider 配置，那么创建会话时可以只传：
+
+```json
+{
+  "config_name": "applemail-prod",
+  "purpose": "chatgpt-signup"
+}
+```
+
+或者：
+
+```json
+{
+  "config_id": 12,
+  "purpose": "chatgpt-signup"
+}
+```
+
+此时服务会自动取回保存的 `provider / extra / proxy`。
+
+如果同时传了显式 `extra`，会覆盖保存配置中的同名键。
 
 ### 6.5 查询会话
 
@@ -519,7 +575,65 @@ MAILBOX_SERVICE_DATABASE_URL=sqlite:////runtime/mailbox_service.db
 
 里取，不要假设 `account_id` 仍然等于老系统里的 provider token。
 
-## 9. Provider 配置键
+## 9. 管理后台与保存配置
+
+### 9.1 管理后台
+
+访问：
+
+- `/admin`
+
+当前后台支持：
+
+- 查看支持的 provider 字段说明
+- 新增保存的 provider 配置
+- 修改、启用、禁用、删除配置
+- 一键校验配置
+- 查看最近邮箱会话
+
+注意：
+
+- 页面本身可打开，但实际数据读取和写入仍要求 API Key。
+- 当前页面把 API Key 只保存在浏览器当前标签页。
+
+### 9.2 管理 API
+
+#### 列出 provider 字段目录
+
+`GET /api/admin/provider-catalog`
+
+返回每个 provider 的：
+
+- `name`
+- `description`
+- `fields`
+- `example_extra`
+
+#### 列出保存配置
+
+`GET /api/admin/provider-configs`
+
+#### 新建保存配置
+
+`POST /api/admin/provider-configs`
+
+#### 更新保存配置
+
+`PUT /api/admin/provider-configs/{id}`
+
+#### 删除保存配置
+
+`DELETE /api/admin/provider-configs/{id}`
+
+#### 校验保存配置
+
+`POST /api/admin/provider-configs/{id}/validate`
+
+#### 查看最近会话
+
+`GET /api/admin/recent-sessions`
+
+## 10. Provider 配置键
 
 所有 provider 配置都通过 `extra` 透传到 `core/base_mailbox.py:create_local_mailbox()`。
 
@@ -599,7 +713,7 @@ MAILBOX_SERVICE_DATABASE_URL=sqlite:////runtime/mailbox_service.db
 
 `applemail_accounts` 是文本串，按账号行组织，当前实现按 provider 内部格式解析。
 
-## 10. 状态机与持久化
+## 11. 状态机与持久化
 
 当前会话状态可能包括：
 
@@ -614,19 +728,20 @@ MAILBOX_SERVICE_DATABASE_URL=sqlite:////runtime/mailbox_service.db
 
 - `mailbox_service_sessions`
 - `mailbox_service_session_events`
+- `mailbox_provider_configs`
 
 注意：
 
 - `extra`、`proxy`、`account_extra` 会被持久化到数据库。
 - 如果这些字段里放了 provider token、代理账号、邮箱凭据，数据库就属于敏感资产。
 
-## 11. 安全与部署建议
+## 12. 安全与部署建议
 
 ### 11.1 当前实现采用 API Key 鉴权
 
 因此：
 
-- 调用方必须通过 `Authorization: Bearer <token>` 或 `X-API-Key: <token>` 访问 `/api/mailbox-service/*`。
+- 调用方必须通过 `Authorization: Bearer <token>` 或 `X-API-Key: <token>` 访问 `/api/mailbox-service/*` 和 `/api/admin/*`。
 - 仍然不要把服务直接裸露到公网。
 - 推荐只部署在内网，或挂在已有 API 网关后面继续做限流、审计。
 
@@ -656,7 +771,7 @@ MAILBOX_SERVICE_DATABASE_URL=sqlite:////runtime/mailbox_service.db
 
 这里的“更适合单实例”是基于当前代码实现得出的工程判断，不是协议层硬限制。
 
-## 12. 扩展新 provider 的步骤
+## 13. 扩展新 provider 的步骤
 
 如果你要新增邮箱 provider，按这个顺序改：
 
@@ -676,7 +791,7 @@ MAILBOX_SERVICE_DATABASE_URL=sqlite:////runtime/mailbox_service.db
 - `wait_for_code()` 超时时抛出明确异常
 - provider 异常信息尽量可读，便于映射成统一错误码
 
-## 13. AppleMail 诊断工具
+## 14. AppleMail 诊断工具
 
 仓库自带 AppleMail 诊断 CLI，用来排查“收不到验证码”“INBOX/Junk 行为异常”“返回 payload 结构变化”等问题。
 
@@ -698,7 +813,7 @@ python scripts/applemail_diagnose.py \
 - 按时间窗口过滤
 - 按发件人、主题、内容过滤
 
-## 14. 回归测试
+## 15. 回归测试
 
 建议至少运行：
 
@@ -717,7 +832,7 @@ python -m unittest \
 - AppleMail payload 兼容性
 - AppleMail 诊断工具过滤逻辑
 
-## 15. 给接入方的最终建议
+## 16. 给接入方的最终建议
 
 如果你是其他项目或其他 agent，要接这个仓库，按下面的原则做：
 

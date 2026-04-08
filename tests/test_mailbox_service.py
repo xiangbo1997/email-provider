@@ -14,6 +14,7 @@ from sqlmodel import Session, delete
 
 from core.base_mailbox import MailboxAccount, MailboxServiceBackedMailbox
 from services.mailbox_service import (
+    MailboxProviderConfigModel,
     MailboxSessionEventModel,
     MailboxSessionModel,
     init_mailbox_service_db,
@@ -58,6 +59,7 @@ class MailboxServiceTests(unittest.TestCase):
 
     def setUp(self):
         with Session(mailbox_service_engine) as session:
+            session.exec(delete(MailboxProviderConfigModel))
             session.exec(delete(MailboxSessionEventModel))
             session.exec(delete(MailboxSessionModel))
             session.commit()
@@ -112,6 +114,29 @@ class MailboxServiceTests(unittest.TestCase):
             account = mailbox.get_email()
             with self.assertRaises(RuntimeError):
                 mailbox.wait_for_code(account, timeout=10, before_ids=set())
+
+    def test_saved_provider_config_can_drive_session_creation(self):
+        fake_mailbox = _FakeMailbox()
+        with mock.patch("core.base_mailbox.create_local_mailbox", return_value=fake_mailbox):
+            saved = mailbox_service.create_provider_config(
+                name="demo-laoudo",
+                provider="laoudo",
+                extra={"laoudo_email": "demo@example.com"},
+                proxy="socks5h://127.0.0.1:1080",
+                description="demo",
+            )
+            runtime = mailbox_service.resolve_provider_request(config_id=saved["id"])
+            self.assertEqual(runtime["provider"], "laoudo")
+            self.assertEqual(runtime["proxy"], "socks5h://127.0.0.1:1080")
+            self.assertEqual(runtime["config"]["name"], "demo-laoudo")
+
+            lease = mailbox_service.acquire_session(
+                provider=runtime["provider"],
+                extra=runtime["extra"],
+                proxy=runtime["proxy"],
+                purpose="register",
+            )
+            self.assertEqual(lease.email, "demo@example.com")
 
 
 if __name__ == "__main__":

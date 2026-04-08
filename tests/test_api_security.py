@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
 
 from fastapi.testclient import TestClient
+
+
+_DB_PATH = os.path.join(tempfile.gettempdir(), "email_provider_api_security_test.db")
+os.environ["MAILBOX_SERVICE_DATABASE_URL"] = f"sqlite:///{_DB_PATH}"
 
 from main import app
 

@@ -5,8 +5,10 @@
 当前仓库包含：
 
 - 统一邮箱 provider 适配层
+- 保存的 provider 配置管理
 - 会话/租约式邮箱服务核心
 - FastAPI 路由
+- 管理后台
 - AppleMail 诊断工具
 - 基础回归测试
 
@@ -40,6 +42,12 @@ docker compose up -d --build
 - `Authorization: Bearer <EMAIL_PROVIDER_API_KEY>`
 - 或 `X-API-Key: <EMAIL_PROVIDER_API_KEY>`
 
+管理后台：
+
+- `GET /admin`
+- 页面本身可打开，但后台数据请求仍要求 API Key
+- 管理页里的 API Key 只保存在当前浏览器标签页
+
 健康检查：
 
 - `GET /healthz` 无鉴权，供容器或进程探活
@@ -55,6 +63,13 @@ docker compose up -d --build
 - `GET /api/mailbox-service/sessions/{id}`
 - `POST /api/mailbox-service/sessions/{id}/poll-code`
 - `POST /api/mailbox-service/sessions/{id}/complete`
+- `GET /api/admin/provider-catalog`
+- `GET /api/admin/provider-configs`
+- `POST /api/admin/provider-configs`
+- `PUT /api/admin/provider-configs/{id}`
+- `DELETE /api/admin/provider-configs/{id}`
+- `POST /api/admin/provider-configs/{id}/validate`
+- `GET /api/admin/recent-sessions`
 
 默认数据库：
 

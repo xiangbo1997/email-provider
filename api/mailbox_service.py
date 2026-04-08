@@ -15,7 +15,9 @@ router = APIRouter(
 
 
 class CreateMailboxSessionRequest(BaseModel):
-    provider: str
+    provider: str | None = None
+    config_id: int | None = None
+    config_name: str | None = None
     purpose: str = "generic"
     proxy: str | None = None
     extra: dict = Field(default_factory=dict)
@@ -78,6 +80,13 @@ def validate_mailbox_service_provider(provider: str, body: ValidateMailboxProvid
 @router.post("/sessions")
 def create_mailbox_session(body: CreateMailboxSessionRequest):
     try:
+        runtime = mailbox_service.resolve_provider_request(
+            provider=body.provider,
+            extra=body.extra,
+            proxy=body.proxy,
+            config_id=body.config_id,
+            config_name=body.config_name,
+        )
         account_override = None
         if body.email:
             from core.base_mailbox import MailboxAccount
@@ -88,9 +97,9 @@ def create_mailbox_session(body: CreateMailboxSessionRequest):
                 extra=body.account_extra,
             )
         lease = mailbox_service.acquire_session(
-            provider=body.provider,
-            extra=body.extra,
-            proxy=body.proxy,
+            provider=runtime["provider"],
+            extra=runtime["extra"],
+            proxy=runtime["proxy"],
             purpose=body.purpose,
             account_override=account_override,
             lease_seconds=body.lease_seconds,
@@ -107,6 +116,7 @@ def create_mailbox_session(body: CreateMailboxSessionRequest):
         "expires_at": lease.expires_at,
         "before_ids": lease.before_ids,
         "provider_meta": lease.provider_meta,
+        "provider_config": runtime["config"],
     }
 
 

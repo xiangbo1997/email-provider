@@ -36,6 +36,17 @@
 - `GET /api/mailbox-service/sessions/{session_id}`
 - `POST /api/mailbox-service/sessions/{session_id}/poll-code`
 - `POST /api/mailbox-service/sessions/{session_id}/complete`
+- `GET /api/admin/provider-catalog`
+- `GET /api/admin/provider-configs`
+- `POST /api/admin/provider-configs`
+- `PUT /api/admin/provider-configs/{id}`
+- `DELETE /api/admin/provider-configs/{id}`
+- `POST /api/admin/provider-configs/{id}/validate`
+- `GET /api/admin/recent-sessions`
+
+管理界面：
+
+- `GET /admin`
 
 如果你必须在 Python 进程内复用旧调用面，再看 `core/base_mailbox.py` 里的：
 
@@ -64,6 +75,13 @@
    传 `email`，必要时传 `account_id` 和 `account_extra`。这用于“第二阶段二次取码”或“业务端已知邮箱上下文”的场景。
 
 第二种模式是给 Kiro/LuckMail 这类已知邮箱场景准备的，避免主项目重复实现 provider 特判。
+
+另外，现在可以先通过管理后台或管理 API 保存 provider 配置，再在创建会话时传：
+
+- `config_id`
+- `config_name`
+
+这样调用方不需要每次都重复提交整份 `extra`。
 
 ## Important Semantics
 
