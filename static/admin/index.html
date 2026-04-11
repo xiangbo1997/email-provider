@@ -6,47 +6,59 @@
     <title>Email Provider Admin</title>
     <link rel="stylesheet" href="/static/admin/styles.css" />
   </head>
-  <body>
-    <div class="shell">
-      <header class="hero">
+  <body data-page="dashboard">
+    <div class="shell" data-testid="admin-shell">
+      <header class="topbar" data-testid="admin-topbar">
         <div>
           <p class="eyebrow">Email Provider Control</p>
           <h1>邮箱服务管理台</h1>
-          <p class="subhead">集中维护 provider 配置，做配置校验，并查看最近邮箱会话状态。</p>
         </div>
-        <div class="auth-card">
-          <label for="apiKeyInput">API Key</label>
-          <input id="apiKeyInput" type="password" placeholder="输入 EMAIL_PROVIDER_API_KEY" />
-          <div class="auth-actions">
-            <button id="saveApiKeyBtn" class="primary">保存</button>
-            <button id="clearApiKeyBtn" class="ghost">清除</button>
-          </div>
-          <p id="authStatus" class="hint">尚未保存 API Key</p>
+        <div class="topbar-actions">
+          <span id="adminIdentity" class="muted" data-testid="admin-identity">-</span>
+          <button id="refreshAllBtn" class="ghost" data-testid="admin-refresh-all" type="button">刷新</button>
+          <button id="logoutBtn" class="danger" data-testid="logout-button" type="button">退出</button>
         </div>
       </header>
+
+      <section class="summary-grid" data-testid="admin-summary">
+        <article class="summary-card"><span>配置总数</span><strong id="summaryConfigTotal" data-testid="summary-config-total">0</strong></article>
+        <article class="summary-card"><span>启用配置</span><strong id="summaryConfigEnabled" data-testid="summary-config-enabled">0</strong></article>
+        <article class="summary-card"><span>最近会话</span><strong id="summarySessionRecent" data-testid="summary-session-recent">0</strong></article>
+        <article class="summary-card"><span>失败会话</span><strong id="summarySessionFailed" data-testid="summary-session-failed">0</strong></article>
+      </section>
 
       <main class="grid">
         <section class="panel list-panel">
           <div class="panel-head">
             <div>
               <p class="kicker">Provider Configs</p>
-              <h2>保存的厂商配置</h2>
+              <h2>保存配置</h2>
             </div>
-            <button id="refreshConfigsBtn" class="ghost">刷新</button>
           </div>
-          <div id="configList" class="config-list"></div>
+          <div class="toolbar" data-testid="config-toolbar">
+            <input id="configSearchInput" data-testid="config-search-input" type="search" placeholder="搜索配置名/说明" />
+            <select id="configProviderFilter" data-testid="config-filter-provider">
+              <option value="">全部 provider</option>
+            </select>
+            <select id="configEnabledFilter" data-testid="config-filter-enabled">
+              <option value="">启用状态</option>
+              <option value="true">已启用</option>
+              <option value="false">已禁用</option>
+            </select>
+            <button id="newConfigBtn" class="ghost" data-testid="config-create-button" type="button">新建</button>
+          </div>
+          <div id="configList" class="config-list" data-testid="config-list"></div>
         </section>
 
-        <section class="panel editor-panel">
+        <section class="panel editor-panel" data-testid="config-editor">
           <div class="panel-head">
             <div>
               <p class="kicker">Editor</p>
-              <h2>配置编辑器</h2>
+              <h2>配置详情</h2>
             </div>
             <div class="actions">
-              <button id="newConfigBtn" class="ghost">新建</button>
-              <button id="fillTemplateBtn" class="ghost">填充模板</button>
-              <button id="saveConfigBtn" class="primary">保存配置</button>
+              <button id="fillTemplateBtn" class="ghost" data-testid="config-fill-template" type="button">填充模板</button>
+              <button id="saveConfigBtn" class="primary" data-testid="config-save" type="button">保存</button>
             </div>
           </div>
 
@@ -57,60 +69,88 @@
             </label>
             <label>
               <span>配置名称</span>
-              <input id="configNameInput" type="text" placeholder="例如 applemail-prod" />
+              <input id="configNameInput" data-testid="config-name-input" type="text" />
             </label>
             <label>
               <span>Provider</span>
-              <select id="providerSelect"></select>
+              <select id="providerSelect" data-testid="config-provider-select"></select>
             </label>
             <label class="checkbox">
-              <input id="enabledCheckbox" type="checkbox" checked />
+              <input id="enabledCheckbox" data-testid="config-enabled-toggle" type="checkbox" checked />
               <span>启用</span>
             </label>
             <label class="full">
               <span>代理</span>
-              <input id="proxyInput" type="text" placeholder="可选，如 socks5h://user:pass@host:port" />
+              <div class="input-with-action">
+                <input id="proxyInput" data-testid="config-proxy-input" type="password" />
+                <button id="toggleProxyBtn" type="button" class="ghost">显示</button>
+              </div>
             </label>
             <label class="full">
               <span>说明</span>
-              <input id="descriptionInput" type="text" placeholder="例如 ChatGPT 注册专用 AppleMail 池" />
-            </label>
-            <label class="full">
-              <span>Extra JSON</span>
-              <textarea id="extraJsonInput" rows="14" spellcheck="false"></textarea>
+              <input id="descriptionInput" data-testid="config-description-input" type="text" />
             </label>
           </div>
+
+          <section class="provider-fields" data-testid="provider-fields">
+            <h3>Provider 字段</h3>
+            <div id="providerFieldsContainer"></div>
+          </section>
+
+          <section class="advanced-panel">
+            <label class="checkbox">
+              <input id="advancedJsonToggle" data-testid="config-json-toggle" type="checkbox" />
+              <span>使用高级 JSON 编辑</span>
+            </label>
+            <textarea id="extraJsonInput" data-testid="config-json-editor" rows="10" spellcheck="false" class="hidden"></textarea>
+          </section>
 
           <div class="editor-footer">
             <div class="actions">
-              <button id="validateConfigBtn" class="secondary">校验配置</button>
-              <button id="deleteConfigBtn" class="danger">删除配置</button>
+              <button id="validateConfigBtn" class="secondary" data-testid="config-validate" type="button">校验</button>
+              <button id="deleteConfigBtn" class="danger" data-testid="config-delete" type="button">删除</button>
             </div>
-            <p id="formStatus" class="hint">选择左侧配置，或新建一个配置。</p>
+            <p id="formStatus" class="hint" data-testid="config-feedback">选择左侧配置或新建。</p>
           </div>
         </section>
 
-        <section class="panel catalog-panel">
+        <section class="panel catalog-panel" data-testid="provider-guide">
           <div class="panel-head">
             <div>
               <p class="kicker">Catalog</p>
               <h2>Provider 字段说明</h2>
             </div>
           </div>
-          <div id="providerGuide" class="guide"></div>
+          <div id="providerGuide"></div>
         </section>
 
         <section class="panel sessions-panel">
           <div class="panel-head">
             <div>
               <p class="kicker">Sessions</p>
-              <h2>最近邮箱会话</h2>
+              <h2>最近会话</h2>
             </div>
-            <button id="refreshSessionsBtn" class="ghost">刷新</button>
           </div>
-          <div id="sessionList" class="session-list"></div>
+          <div class="toolbar" data-testid="session-toolbar">
+            <select id="sessionProviderFilter" data-testid="session-filter-provider">
+              <option value="">全部 provider</option>
+            </select>
+            <select id="sessionStateFilter" data-testid="session-filter-state">
+              <option value="">全部状态</option>
+              <option value="leased">leased</option>
+              <option value="polling">polling</option>
+              <option value="code_ready">code_ready</option>
+              <option value="failed">failed</option>
+              <option value="completed">completed</option>
+              <option value="expired">expired</option>
+            </select>
+            <button id="refreshSessionsBtn" class="ghost" data-testid="session-refresh" type="button">刷新会话</button>
+          </div>
+          <div id="sessionList" class="session-list" data-testid="session-list"></div>
         </section>
       </main>
+
+      <div id="toastContainer" class="toast-container" data-testid="toast-container"></div>
     </div>
 
     <template id="configCardTemplate">
@@ -122,4 +162,4 @@
 
     <script src="/static/admin/app.js"></script>
   </body>
-  </html>
+</html>

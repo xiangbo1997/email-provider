@@ -49,7 +49,18 @@ class ValidateMailboxProviderRequest(BaseModel):
 
 
 def _raise_http(exc: MailboxServiceError):
-    raise HTTPException(status_code=400, detail={"code": exc.code, "message": exc.message})
+    status_code = 400
+    if exc.code.endswith("_NOT_FOUND"):
+        status_code = 404
+    elif exc.code.endswith("_EXISTS"):
+        status_code = 409
+    elif exc.code in {"INVALID_LEASE"}:
+        status_code = 401
+    elif exc.code in {"LEASE_EXPIRED"}:
+        status_code = 410
+    elif exc.code in {"ENCRYPTION_NOT_CONFIGURED"}:
+        status_code = 503
+    raise HTTPException(status_code=status_code, detail={"code": exc.code, "message": exc.message})
 
 
 @router.get("/health")

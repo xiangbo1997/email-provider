@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Email Provider Admin Login</title>
+    <link rel="stylesheet" href="/static/admin/styles.css" />
+  </head>
+  <body data-page="login">
+    <main class="login-shell" data-testid="login-page">
+      <section class="login-card">
+        <p class="eyebrow">Email Provider Control</p>
+        <h1>管理员登录</h1>
+        <p class="subhead">登录后管理 provider 配置与邮箱会话。</p>
+
+        <form id="loginForm" class="login-form" data-testid="login-form">
+          <label>
+            <span>用户名</span>
+            <input id="usernameInput" data-testid="login-username" type="text" autocomplete="username" required />
+          </label>
+          <label>
+            <span>密码</span>
+            <input id="passwordInput" data-testid="login-password" type="password" autocomplete="current-password" required />
+          </label>
+          <button id="loginSubmitBtn" data-testid="login-submit" class="primary" type="submit">登录</button>
+          <p id="loginError" data-testid="login-error" class="hint danger-text hidden"></p>
+        </form>
+      </section>
+    </main>
+
+    <script src="/static/admin/app.js"></script>
+  </body>
+</html>
