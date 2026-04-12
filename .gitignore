@@ -8,3 +8,9 @@ mailbox_service.db
 data/
 .env
 runtime/
+.venv/
+node_modules/
+test-results/
+tests/e2e/playwright-report/
+.codex/
+.agents/
