@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from api.admin import router as admin_router
@@ -38,7 +38,7 @@ def on_startup():
 
 
 @app.middleware("http")
-async def security_headers_middleware(request: Request, call_next):
+async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
     return apply_response_security_headers(request, response)
 
@@ -59,14 +59,14 @@ def healthz():
     return {"ok": True}
 
 
-@app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
+@app.get("/admin", response_class=HTMLResponse)
 def admin_console(request: Request):
     if not get_optional_admin_session(request):
         return RedirectResponse(url="/admin/login", status_code=303)
     return HTMLResponse((_admin_dir / "index.html").read_text(encoding="utf-8"))
 
 
-@app.get("/admin/login", response_class=HTMLResponse, include_in_schema=False)
+@app.get("/admin/login", response_class=HTMLResponse)
 def admin_login_page(request: Request):
     if get_optional_admin_session(request):
         return RedirectResponse(url="/admin", status_code=303)

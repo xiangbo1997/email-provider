@@ -1,75 +1,63 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
-
-from tests.fixtures import TEST_API_KEY, bootstrap_database, clean_database, prepare_test_environment
-
-prepare_test_environment("email_provider_api_security_test.db")
 
 from fastapi.testclient import TestClient
 
+from tests.test_support import DEFAULT_API_KEY, clean_all_tables, configure_test_env
+
+_DB_PATH = os.path.join(tempfile.gettempdir(), "email_provider_api_security_test.db")
+configure_test_env(_DB_PATH)
+
 from main import app
-from services.admin_auth_service import AdminAuthEventModel, AdminLoginAttemptModel, AdminWebSessionModel
-from services.mailbox_service import MailboxProviderConfigModel, MailboxSessionEventModel, MailboxSessionModel
 
 
 class ApiSecurityTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        bootstrap_database("email_provider_api_security_test.db")
-
     def setUp(self):
-        clean_database(
-            [
-                AdminAuthEventModel,
-                AdminLoginAttemptModel,
-                AdminWebSessionModel,
-                MailboxProviderConfigModel,
-                MailboxSessionEventModel,
-                MailboxSessionModel,
-            ]
-        )
-        self.client = TestClient(app)
+        clean_all_tables()
 
-    def test_protected_route_requires_api_key(self):
-        old_disabled = os.environ.get("EMAIL_PROVIDER_AUTH_DISABLED")
-        os.environ.pop("EMAIL_PROVIDER_AUTH_DISABLED", None)
-        try:
-            response = self.client.get("/api/mailbox-service/providers")
-            self.assertEqual(response.status_code, 401)
-            self.assertEqual(response.json()["detail"]["code"], "UNAUTHORIZED")
-        finally:
-            if old_disabled is None:
-                os.environ.pop("EMAIL_PROVIDER_AUTH_DISABLED", None)
-            else:
-                os.environ["EMAIL_PROVIDER_AUTH_DISABLED"] = old_disabled
+    def test_mailbox_service_route_requires_api_key(self):
+        client = TestClient(app)
+        response = client.get("/api/mailbox-service/providers")
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["detail"]["code"], "UNAUTHORIZED")
 
-    def test_protected_route_accepts_bearer_token(self):
-        response = self.client.get(
+    def test_mailbox_service_route_accepts_bearer_token(self):
+        client = TestClient(app)
+        response = client.get(
             "/api/mailbox-service/providers",
-            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+            headers={"Authorization": f"Bearer {DEFAULT_API_KEY}"},
         )
         self.assertEqual(response.status_code, 200)
 
     def test_healthz_remains_public(self):
-        response = self.client.get("/healthz")
+        client = TestClient(app)
+        response = client.get("/healthz")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"ok": True})
 
-    def test_admin_routes_do_not_bypass_login_when_mailbox_auth_disabled(self):
+    def test_admin_page_redirects_to_login_when_not_authenticated(self):
+        client = TestClient(app, follow_redirects=False)
+        response = client.get("/admin")
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/admin/login")
+
+        login_page = client.get("/admin/login")
+        self.assertEqual(login_page.status_code, 200)
+        self.assertIn("管理员登录", login_page.text)
+
+    def test_auth_disabled_does_not_bypass_admin_routes(self):
+        client = TestClient(app)
         old_disabled = os.environ.get("EMAIL_PROVIDER_AUTH_DISABLED")
         os.environ["EMAIL_PROVIDER_AUTH_DISABLED"] = "1"
         try:
-            unauthorized = self.client.get("/api/admin/provider-catalog")
-            self.assertEqual(unauthorized.status_code, 401)
-            self.assertEqual(unauthorized.json()["detail"]["code"], "UNAUTHORIZED")
+            mailbox_resp = client.get("/api/mailbox-service/providers")
+            self.assertEqual(mailbox_resp.status_code, 200)
 
-            authorized = self.client.get(
-                "/api/admin/provider-catalog",
-                headers={"Authorization": f"Bearer {TEST_API_KEY}"},
-            )
-            self.assertEqual(authorized.status_code, 200)
+            admin_resp = client.get("/api/admin/provider-catalog")
+            self.assertEqual(admin_resp.status_code, 401)
         finally:
             if old_disabled is None:
                 os.environ.pop("EMAIL_PROVIDER_AUTH_DISABLED", None)

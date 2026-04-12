@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from sqlalchemy import or_
+from sqlalchemy import inspect, or_, text
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, SQLModel, Session, select
 
@@ -42,11 +42,44 @@ def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _json_loads(value: str, default: Any) -> Any:
+    try:
+        loaded = json.loads(value or "")
+    except Exception:
+        return default
+    return loaded if loaded is not None else default
+
+
+def _raise_storage_write_error(exc: CryptoConfigError) -> None:
+    raise MailboxServiceError("ENCRYPTION_NOT_CONFIGURED", str(exc)) from exc
+
+
+def _raise_storage_read_error(exc: CryptoConfigError) -> None:
+    raise MailboxServiceError("ENCRYPTION_NOT_CONFIGURED", str(exc)) from exc
+
+
+def _encrypt_string_maybe(value: str | None) -> str:
+    return encrypt_string(value)
+
+
+def _encrypt_json_maybe(value: Any) -> str:
+    return encrypt_json(value)
+
+
+def _decrypt_string_maybe(value: str | None, *, default: str = "") -> str:
+    return decrypt_string(value, default=default)
+
+
+def _decrypt_json_maybe(value: str | None, default: Any) -> Any:
+    return decrypt_json(value, default)
+
+
 class MailboxSessionModel(SQLModel, table=True):
     __tablename__ = "mailbox_service_sessions"
 
     session_id: str = Field(primary_key=True)
-    lease_token: str
+    lease_token: str = ""
+    lease_token_hash: str = Field(default="", index=True)
     provider: str = Field(index=True)
     email: str = Field(index=True)
     account_id: str = ""
@@ -298,6 +331,12 @@ class MailboxService:
         MailboxSessionEventModel.__table__.create(engine, checkfirst=True)
         MailboxProviderConfigModel.__table__.create(engine, checkfirst=True)
 
+        inspector = inspect(engine)
+        columns = {item.get("name") for item in inspector.get_columns("mailbox_service_sessions")}
+        if "lease_token_hash" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE mailbox_service_sessions ADD COLUMN lease_token_hash VARCHAR DEFAULT ''"))
+
     def list_providers(self) -> list[dict[str, Any]]:
         return [{"name": name, "mode": "legacy_adapter"} for name in self.SUPPORTED_PROVIDERS]
 
@@ -341,40 +380,43 @@ class MailboxService:
     def list_provider_configs(
         self,
         *,
-        q: str = "",
+        q: str | None = None,
         provider: str | None = None,
         enabled: bool | None = None,
-        limit: int = 100,
+        limit: int = 200,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        safe_limit = max(1, min(int(limit or 100), 200))
-        safe_offset = max(0, int(offset or 0))
-        with Session(get_mailbox_service_engine()) as session:
-            stmt = select(MailboxProviderConfigModel)
-            keyword = str(q or "").strip()
-            if keyword:
-                stmt = stmt.where(
-                    or_(
-                        MailboxProviderConfigModel.name.contains(keyword),
-                        MailboxProviderConfigModel.description.contains(keyword),
+        try:
+            with Session(get_mailbox_service_engine()) as session:
+                stmt = select(MailboxProviderConfigModel)
+                if str(provider or "").strip():
+                    stmt = stmt.where(MailboxProviderConfigModel.provider == str(provider).strip())
+                if enabled is not None:
+                    stmt = stmt.where(MailboxProviderConfigModel.enabled == bool(enabled))
+                keyword = str(q or "").strip()
+                if keyword:
+                    stmt = stmt.where(
+                        MailboxProviderConfigModel.name.contains(keyword)
+                        | MailboxProviderConfigModel.description.contains(keyword)
                     )
+                stmt = stmt.order_by(
+                    MailboxProviderConfigModel.updated_at.desc(),
+                    MailboxProviderConfigModel.id.desc(),
                 )
-            if str(provider or "").strip():
-                stmt = stmt.where(MailboxProviderConfigModel.provider == str(provider).strip())
-            if enabled is not None:
-                stmt = stmt.where(MailboxProviderConfigModel.enabled == bool(enabled))
-            stmt = stmt.order_by(
-                MailboxProviderConfigModel.updated_at.desc(),
-                MailboxProviderConfigModel.id.desc(),
-            ).offset(safe_offset).limit(safe_limit)
-            return [self._to_provider_config_summary(item) for item in session.exec(stmt).all()]
+                stmt = stmt.offset(max(0, int(offset or 0))).limit(max(1, min(int(limit or 200), 500)))
+                return [self._to_provider_config_summary(item) for item in session.exec(stmt).all()]
+        except CryptoConfigError as exc:
+            _raise_storage_read_error(exc)
 
     def get_provider_config(self, config_id: int) -> dict[str, Any]:
-        with Session(get_mailbox_service_engine()) as session:
-            model = session.get(MailboxProviderConfigModel, config_id)
-            if not model:
-                raise MailboxServiceError("PROVIDER_CONFIG_NOT_FOUND", f"未找到 provider 配置: {config_id}")
-            return self._to_provider_config_detail(model)
+        try:
+            with Session(get_mailbox_service_engine()) as session:
+                model = session.get(MailboxProviderConfigModel, config_id)
+                if not model:
+                    raise MailboxServiceError("PROVIDER_CONFIG_NOT_FOUND", f"未找到 provider 配置: {config_id}")
+                return self._to_provider_config_detail(model)
+        except CryptoConfigError as exc:
+            _raise_storage_read_error(exc)
 
     def create_provider_config(
         self,
@@ -390,20 +432,22 @@ class MailboxService:
         if not clean_name:
             raise MailboxServiceError("PROVIDER_CONFIG_NAME_REQUIRED", "provider 配置名称不能为空")
         self.validate_provider(provider)
-        model = MailboxProviderConfigModel(
-            name=clean_name,
-            provider=provider,
-            enabled=bool(enabled),
-            description=str(description or "").strip(),
-            proxy=self._encrypt_string_field(proxy),
-            extra_json=self._encrypt_json_field(dict(extra or {})),
-        )
         try:
+            model = MailboxProviderConfigModel(
+                name=clean_name,
+                provider=provider,
+                enabled=bool(enabled),
+                description=str(description or "").strip(),
+                proxy=_encrypt_string_maybe(proxy),
+                extra_json=_encrypt_json_maybe(dict(extra or {})),
+            )
             with Session(get_mailbox_service_engine()) as session:
                 session.add(model)
                 session.commit()
                 session.refresh(model)
                 return self._to_provider_config_detail(model)
+        except CryptoConfigError as exc:
+            _raise_storage_write_error(exc)
         except IntegrityError as exc:
             raise MailboxServiceError("PROVIDER_CONFIG_NAME_EXISTS", f"provider 配置名称已存在: {clean_name}") from exc
 
@@ -431,13 +475,15 @@ class MailboxService:
                 model.provider = provider
                 model.enabled = bool(enabled)
                 model.description = str(description or "").strip()
-                model.proxy = self._encrypt_string_field(proxy)
-                model.extra_json = self._encrypt_json_field(dict(extra or {}))
+                model.proxy = _encrypt_string_maybe(proxy)
+                model.extra_json = _encrypt_json_maybe(dict(extra or {}))
                 model.updated_at = _utcnow()
                 session.add(model)
                 session.commit()
                 session.refresh(model)
                 return self._to_provider_config_detail(model)
+        except CryptoConfigError as exc:
+            _raise_storage_write_error(exc)
         except IntegrityError as exc:
             raise MailboxServiceError("PROVIDER_CONFIG_NAME_EXISTS", f"provider 配置名称已存在: {clean_name}") from exc
 
@@ -450,44 +496,45 @@ class MailboxService:
             session.commit()
 
     def validate_saved_provider_config(self, config_id: int) -> dict[str, Any]:
-        with Session(get_mailbox_service_engine()) as session:
-            model = session.get(MailboxProviderConfigModel, config_id)
-            if not model:
-                raise MailboxServiceError("PROVIDER_CONFIG_NOT_FOUND", f"未找到 provider 配置: {config_id}")
-            provider = model.provider
-            extra = self._decrypt_json_field(model.extra_json, {})
-            proxy = self._decrypt_string_field(model.proxy) or None
-
         try:
-            result = self.validate_provider_config(provider=provider, extra=extra, proxy=proxy)
-            ok = True
-            message = "ok"
-        except MailboxServiceError:
-            raise
-        except Exception as exc:
-            result = {"ok": False, "provider": provider}
-            ok = False
-            message = redact_sensitive_text(str(exc))
+            with Session(get_mailbox_service_engine()) as session:
+                model = session.get(MailboxProviderConfigModel, config_id)
+                if not model:
+                    raise MailboxServiceError("PROVIDER_CONFIG_NOT_FOUND", f"未找到 provider 配置: {config_id}")
+                provider = model.provider
+                extra = dict(_decrypt_json_maybe(model.extra_json, {}))
+                proxy = _decrypt_string_maybe(model.proxy, default="") or None
 
-        with Session(get_mailbox_service_engine()) as session:
-            model = session.get(MailboxProviderConfigModel, config_id)
-            if not model:
-                raise MailboxServiceError("PROVIDER_CONFIG_NOT_FOUND", f"未找到 provider 配置: {config_id}")
-            model.last_validated_at = _utcnow()
-            model.last_validation_ok = ok
-            model.last_validation_message = message
-            model.updated_at = _utcnow()
-            session.add(model)
-            session.commit()
-            session.refresh(model)
+            try:
+                result = self.validate_provider_config(provider=provider, extra=extra, proxy=proxy)
+                ok = True
+                message = "ok"
+            except Exception as exc:
+                result = {"ok": False, "provider": provider}
+                ok = False
+                message = redact_sensitive_text(str(exc))
 
-        response = self._to_provider_config_detail(model)
-        response["validation"] = {
-            "ok": ok,
-            "message": message,
-            "provider": result.get("provider", provider),
-        }
-        return response
+            with Session(get_mailbox_service_engine()) as session:
+                model = session.get(MailboxProviderConfigModel, config_id)
+                if not model:
+                    raise MailboxServiceError("PROVIDER_CONFIG_NOT_FOUND", f"未找到 provider 配置: {config_id}")
+                model.last_validated_at = _utcnow()
+                model.last_validation_ok = ok
+                model.last_validation_message = redact_sensitive_text(message)
+                model.updated_at = _utcnow()
+                session.add(model)
+                session.commit()
+                session.refresh(model)
+
+            response = self._to_provider_config_detail(model)
+            response["validation"] = {
+                "ok": ok,
+                "message": redact_sensitive_text(message),
+                "provider": result.get("provider", provider),
+            }
+            return response
+        except CryptoConfigError as exc:
+            _raise_storage_read_error(exc)
 
     def resolve_provider_request(
         self,
@@ -502,35 +549,37 @@ class MailboxService:
         resolved_extra = dict(extra or {})
         resolved_proxy = proxy
         source_config = None
-
-        if config_id is not None or str(config_name or "").strip():
-            source_config = self._get_provider_config_model(
-                config_id=config_id,
-                config_name=config_name,
-                enabled_only=True,
-            )
-            if resolved_provider and resolved_provider != source_config.provider:
-                raise MailboxServiceError(
-                    "PROVIDER_CONFIG_PROVIDER_MISMATCH",
-                    f"provider 与保存配置不一致: {resolved_provider} != {source_config.provider}",
+        try:
+            if config_id is not None or str(config_name or "").strip():
+                source_config = self._get_provider_config_model(
+                    config_id=config_id,
+                    config_name=config_name,
+                    enabled_only=True,
                 )
-            resolved_provider = source_config.provider
-            merged_extra = self._decrypt_json_field(source_config.extra_json, {})
-            merged_extra.update(resolved_extra)
-            resolved_extra = merged_extra
-            if resolved_proxy is None:
-                resolved_proxy = self._decrypt_string_field(source_config.proxy) or None
+                if resolved_provider and resolved_provider != source_config.provider:
+                    raise MailboxServiceError(
+                        "PROVIDER_CONFIG_PROVIDER_MISMATCH",
+                        f"provider 与保存配置不一致: {resolved_provider} != {source_config.provider}",
+                    )
+                resolved_provider = source_config.provider
+                merged_extra = dict(_decrypt_json_maybe(source_config.extra_json, {}))
+                merged_extra.update(resolved_extra)
+                resolved_extra = merged_extra
+                if resolved_proxy is None:
+                    resolved_proxy = _decrypt_string_maybe(source_config.proxy, default="") or None
 
-        if not resolved_provider:
-            raise MailboxServiceError("PROVIDER_REQUIRED", "必须提供 provider，或通过 config_id/config_name 指定保存配置")
+            if not resolved_provider:
+                raise MailboxServiceError("PROVIDER_REQUIRED", "必须提供 provider，或通过 config_id/config_name 指定保存配置")
 
-        self.validate_provider(resolved_provider)
-        return {
-            "provider": resolved_provider,
-            "extra": resolved_extra,
-            "proxy": resolved_proxy,
-            "config": self._to_provider_config_summary(source_config) if source_config else None,
-        }
+            self.validate_provider(resolved_provider)
+            return {
+                "provider": resolved_provider,
+                "extra": resolved_extra,
+                "proxy": resolved_proxy,
+                "config": self._to_provider_config_summary(source_config) if source_config else None,
+            }
+        except CryptoConfigError as exc:
+            _raise_storage_read_error(exc)
 
     def list_recent_sessions(
         self,
@@ -538,31 +587,36 @@ class MailboxService:
         q: str = "",
         provider: str | None = None,
         state: str | None = None,
+        result: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        safe_limit = max(1, min(int(limit or 50), 200))
-        safe_offset = max(0, int(offset or 0))
-        with Session(get_mailbox_service_engine()) as session:
-            stmt = select(MailboxSessionModel)
-            keyword = str(q or "").strip()
-            if keyword:
-                stmt = stmt.where(
-                    or_(
-                        MailboxSessionModel.session_id.contains(keyword),
-                        MailboxSessionModel.email.contains(keyword),
-                        MailboxSessionModel.purpose.contains(keyword),
+        try:
+            with Session(get_mailbox_service_engine()) as session:
+                stmt = select(MailboxSessionModel)
+                keyword = str(q or "").strip()
+                if keyword:
+                    stmt = stmt.where(
+                        or_(
+                            MailboxSessionModel.session_id.contains(keyword),
+                            MailboxSessionModel.email.contains(keyword),
+                            MailboxSessionModel.purpose.contains(keyword),
+                        )
                     )
+                if str(provider or "").strip():
+                    stmt = stmt.where(MailboxSessionModel.provider == str(provider).strip())
+                if str(state or "").strip():
+                    stmt = stmt.where(MailboxSessionModel.state == str(state).strip())
+                if str(result or "").strip():
+                    stmt = stmt.where(MailboxSessionModel.result == str(result).strip())
+                stmt = stmt.order_by(
+                    MailboxSessionModel.created_at.desc(),
+                    MailboxSessionModel.session_id.desc(),
                 )
-            if str(provider or "").strip():
-                stmt = stmt.where(MailboxSessionModel.provider == str(provider).strip())
-            if str(state or "").strip():
-                stmt = stmt.where(MailboxSessionModel.state == str(state).strip())
-            stmt = stmt.order_by(
-                MailboxSessionModel.created_at.desc(),
-                MailboxSessionModel.session_id.desc(),
-            ).offset(safe_offset).limit(safe_limit)
-            return [self._to_session_summary(item) for item in session.exec(stmt).all()]
+                stmt = stmt.offset(max(0, int(offset or 0))).limit(max(1, min(int(limit or 50), 200)))
+                return [self._to_session_summary(item) for item in session.exec(stmt).all()]
+        except CryptoConfigError as exc:
+            _raise_storage_read_error(exc)
 
     def acquire_session(
         self,
@@ -603,10 +657,9 @@ class MailboxService:
 
         provider_meta = self._extract_provider_meta(mailbox=mailbox, account=account)
         expires_at = _utcnow() + timedelta(seconds=max(30, int(lease_seconds or 900)))
-        lease_token = secrets.token_urlsafe(24)
         lease = MailboxLease(
             session_id=uuid.uuid4().hex,
-            lease_token=lease_token,
+            lease_token=secrets.token_urlsafe(24),
             provider=provider,
             email=account.email,
             account_id=str(account.account_id or ""),
@@ -615,34 +668,46 @@ class MailboxService:
             before_ids=before_ids,
             provider_meta=provider_meta,
         )
-        with Session(get_mailbox_service_engine()) as session:
-            model = MailboxSessionModel(
-                session_id=lease.session_id,
-                lease_token=hash_token(lease_token),
-                provider=provider,
-                email=lease.email,
-                account_id=lease.account_id,
-                purpose=str(purpose or "generic"),
-                state=lease.state,
-                proxy=self._encrypt_string_field(proxy),
-                config_json=self._encrypt_json_field(extra),
-                account_extra_json=self._encrypt_json_field(account.extra or {}),
-                before_ids_json=_json_dumps(before_ids),
-                provider_meta_json=self._encrypt_json_field(provider_meta),
-                expires_at=expires_at,
-            )
-            session.add(model)
-            session.commit()
-        self._record_event(lease.session_id, "created", {"email": lease.email, "provider": provider})
+        try:
+            with Session(get_mailbox_service_engine()) as session:
+                model = MailboxSessionModel(
+                    session_id=lease.session_id,
+                    lease_token="",
+                    lease_token_hash=hash_token(lease.lease_token),
+                    provider=provider,
+                    email=lease.email,
+                    account_id=lease.account_id,
+                    purpose=str(purpose or "generic"),
+                    state=lease.state,
+                    proxy=_encrypt_string_maybe(proxy),
+                    config_json=_encrypt_json_maybe(extra),
+                    account_extra_json=_encrypt_json_maybe(account.extra or {}),
+                    before_ids_json=_json_dumps(before_ids),
+                    provider_meta_json=_encrypt_json_maybe(provider_meta),
+                    expires_at=expires_at,
+                )
+                session.add(model)
+                session.commit()
+        except CryptoConfigError as exc:
+            _raise_storage_write_error(exc)
+
+        self._record_event(
+            lease.session_id,
+            "created",
+            {"email": lease.email, "provider": provider, "provider_meta": redact_structure(provider_meta)},
+        )
         return lease
 
     def get_session(self, session_id: str) -> MailboxLease:
-        with Session(get_mailbox_service_engine()) as session:
-            model = session.get(MailboxSessionModel, session_id)
-            if not model:
-                raise MailboxServiceError("SESSION_NOT_FOUND", f"未找到会话: {session_id}")
-            self._expire_if_needed(session, model)
-            return self._to_lease(model)
+        try:
+            with Session(get_mailbox_service_engine()) as session:
+                model = session.get(MailboxSessionModel, session_id)
+                if not model:
+                    raise MailboxServiceError("SESSION_NOT_FOUND", f"未找到会话: {session_id}")
+                self._expire_if_needed(session, model)
+                return self._to_lease(model)
+        except CryptoConfigError as exc:
+            _raise_storage_read_error(exc)
 
     def poll_code(
         self,
@@ -663,8 +728,12 @@ class MailboxService:
             session.add(model)
             session.commit()
 
-        model = self.get_session_model(session_id, lease_token)
-        mailbox, account, snapshot_ids = self._hydrate_runtime(model)
+        try:
+            model = self.get_session_model(session_id, lease_token)
+            mailbox, account, snapshot_ids = self._hydrate_runtime(model)
+        except CryptoConfigError as exc:
+            _raise_storage_read_error(exc)
+
         used_before_ids = set(before_ids or snapshot_ids)
         try:
             code = mailbox.wait_for_code(
@@ -709,34 +778,37 @@ class MailboxService:
         result: str,
         reason: str = "",
     ) -> MailboxLease:
-        with Session(get_mailbox_service_engine()) as session:
-            model = self._get_session_model(session, session_id, lease_token)
-            if model.completed_at:
-                return self._to_lease(model, lease_token=lease_token)
+        try:
+            with Session(get_mailbox_service_engine()) as session:
+                model = self._get_session_model(session, session_id, lease_token)
+                if model.completed_at:
+                    return self._to_lease(model, lease_token=lease_token)
 
-        if str(result or "").lower() == "success":
-            try:
-                mailbox, account, _ = self._hydrate_runtime(self.get_session_model(session_id, lease_token))
-                self._prepare_selected_account(mailbox, account.email)
-                if hasattr(mailbox, "remove_used_account"):
-                    mailbox.remove_used_account()
-            except Exception as exc:
-                self._record_event(session_id, "cleanup_failed", {"message": redact_sensitive_text(str(exc))})
+            if str(result or "").lower() == "success":
+                try:
+                    mailbox, account, _ = self._hydrate_runtime(self.get_session_model(session_id, lease_token))
+                    self._prepare_selected_account(mailbox, account.email)
+                    if hasattr(mailbox, "remove_used_account"):
+                        mailbox.remove_used_account()
+                except Exception as exc:
+                    self._record_event(session_id, "cleanup_failed", {"message": redact_sensitive_text(str(exc))})
 
-        safe_reason = redact_sensitive_text(reason)
-        with Session(get_mailbox_service_engine()) as session:
-            model = self._get_session_model(session, session_id, lease_token)
-            model.result = str(result or "").strip().lower()
-            model.state = "completed"
-            model.completed_at = _utcnow()
-            model.updated_at = _utcnow()
-            if safe_reason:
-                model.error_message = safe_reason
-            session.add(model)
-            session.commit()
-            lease = self._to_lease(model, lease_token=lease_token)
-        self._record_event(session_id, "completed", {"result": result, "reason": safe_reason})
-        return lease
+            safe_reason = redact_sensitive_text(reason)
+            with Session(get_mailbox_service_engine()) as session:
+                model = self._get_session_model(session, session_id, lease_token)
+                model.result = str(result or "").strip().lower()
+                model.state = "completed"
+                model.completed_at = _utcnow()
+                model.updated_at = _utcnow()
+                if safe_reason:
+                    model.error_message = safe_reason
+                session.add(model)
+                session.commit()
+                lease = self._to_lease(model, lease_token=lease_token)
+            self._record_event(session_id, "completed", {"result": result, "reason": safe_reason})
+            return lease
+        except CryptoConfigError as exc:
+            _raise_storage_read_error(exc)
 
     def get_session_model(self, session_id: str, lease_token: str) -> MailboxSessionModel:
         with Session(get_mailbox_service_engine()) as session:
@@ -747,10 +819,10 @@ class MailboxService:
     def _hydrate_runtime(self, model: MailboxSessionModel):
         from core.base_mailbox import MailboxAccount
 
-        extra = self._decrypt_json_field(model.config_json, {})
-        account_extra = self._decrypt_json_field(model.account_extra_json, {})
-        before_ids = set(json.loads(model.before_ids_json or "[]"))
-        proxy = self._decrypt_string_field(model.proxy) or None
+        extra = _decrypt_json_maybe(model.config_json, {})
+        account_extra = _decrypt_json_maybe(model.account_extra_json, {})
+        before_ids = set(_json_loads(model.before_ids_json, []))
+        proxy = _decrypt_string_maybe(model.proxy, default="") or None
         mailbox = self._create_local_mailbox(provider=model.provider, extra=extra, proxy=proxy)
         account = MailboxAccount(
             email=model.email,
@@ -831,8 +903,7 @@ class MailboxService:
     def _expire_if_needed(self, session: Session, model: MailboxSessionModel) -> None:
         if model.completed_at:
             return
-        expires_at = _ensure_utc(model.expires_at)
-        if expires_at and expires_at > _utcnow():
+        if _ensure_utc(model.expires_at) > _utcnow():
             return
         model.state = "expired"
         model.updated_at = _utcnow()
@@ -844,21 +915,25 @@ class MailboxService:
         model = session.get(MailboxSessionModel, session_id)
         if not model:
             raise MailboxServiceError("SESSION_NOT_FOUND", f"未找到会话: {session_id}")
-        if not self._lease_token_matches(model.lease_token, lease_token):
+        if not self._lease_token_matches(model, lease_token):
             raise MailboxServiceError("INVALID_LEASE", "邮箱会话租约无效")
         self._expire_if_needed(session, model)
         return model
 
-    def _lease_token_matches(self, stored_value: str, lease_token: str) -> bool:
+    def _lease_token_matches(self, model: MailboxSessionModel, lease_token: str) -> bool:
         candidate = str(lease_token or "")
-        stored = str(stored_value or "")
-        if not stored or not candidate:
+        if not candidate:
             return False
-        return secrets.compare_digest(stored, candidate) or secrets.compare_digest(stored, hash_token(candidate))
+        stored_hash = str(model.lease_token_hash or "")
+        stored_plain = str(model.lease_token or "")
+        return (
+            (stored_hash and secrets.compare_digest(stored_hash, hash_token(candidate)))
+            or (stored_plain and secrets.compare_digest(stored_plain, candidate))
+        )
 
-    def _to_lease(self, model: MailboxSessionModel, *, lease_token: str = "") -> MailboxLease:
-        provider_meta = self._decrypt_json_field(model.provider_meta_json, {})
-        before_ids = json.loads(model.before_ids_json or "[]")
+    def _to_lease(self, model: MailboxSessionModel, lease_token: str = "") -> MailboxLease:
+        provider_meta = dict(_decrypt_json_maybe(model.provider_meta_json, {}))
+        before_ids = [str(item) for item in _json_loads(model.before_ids_json, []) if str(item)]
         return MailboxLease(
             session_id=model.session_id,
             lease_token=str(lease_token or ""),
@@ -866,15 +941,15 @@ class MailboxService:
             email=model.email,
             account_id=model.account_id or "",
             state=model.state,
-            expires_at=_ensure_utc(model.expires_at) or _utcnow(),
-            before_ids=[str(item) for item in before_ids if str(item)],
-            provider_meta=dict(provider_meta or {}),
+            expires_at=_ensure_utc(model.expires_at),
+            before_ids=before_ids,
+            provider_meta=provider_meta,
         )
 
     def _to_provider_config_summary(self, model: MailboxProviderConfigModel | None) -> dict[str, Any] | None:
         if model is None:
             return None
-        proxy = self._decrypt_string_field(model.proxy)
+        proxy = _decrypt_string_maybe(model.proxy, default="")
         return {
             "id": model.id,
             "name": model.name,
@@ -883,9 +958,9 @@ class MailboxService:
             "description": model.description,
             "proxy_configured": bool(proxy),
             "proxy_masked": mask_proxy(proxy) if proxy else "",
-            "created_at": (_ensure_utc(model.created_at) or _utcnow()).isoformat(),
-            "updated_at": (_ensure_utc(model.updated_at) or _utcnow()).isoformat(),
-            "last_validated_at": (_ensure_utc(model.last_validated_at).isoformat() if model.last_validated_at else None),
+            "created_at": _ensure_utc(model.created_at).isoformat(),
+            "updated_at": _ensure_utc(model.updated_at).isoformat(),
+            "last_validated_at": _ensure_utc(model.last_validated_at).isoformat() if model.last_validated_at else None,
             "last_validation_ok": model.last_validation_ok,
             "last_validation_message": redact_sensitive_text(model.last_validation_message),
         }
@@ -894,17 +969,18 @@ class MailboxService:
         if model is None:
             return None
         payload = self._to_provider_config_summary(model) or {}
-        proxy = self._decrypt_string_field(model.proxy)
         payload.update(
             {
-                "proxy": proxy,
-                "extra": dict(self._decrypt_json_field(model.extra_json, {})),
+                "proxy": _decrypt_string_maybe(model.proxy, default=""),
+                "extra": dict(_decrypt_json_maybe(model.extra_json, {})),
             }
         )
         return payload
 
+    def _to_provider_config(self, model: MailboxProviderConfigModel | None) -> dict[str, Any] | None:
+        return self._to_provider_config_detail(model)
+
     def _to_session_summary(self, model: MailboxSessionModel) -> dict[str, Any]:
-        provider_meta = self._decrypt_json_field(model.provider_meta_json, {})
         return {
             "session_id": model.session_id,
             "provider": model.provider,
@@ -914,12 +990,12 @@ class MailboxService:
             "result": model.result,
             "error_code": model.error_code,
             "error_message": redact_sensitive_text(model.error_message),
-            "provider_meta": redact_structure(provider_meta),
-            "proxy_masked": mask_proxy(self._decrypt_string_field(model.proxy)),
-            "created_at": (_ensure_utc(model.created_at) or _utcnow()).isoformat(),
-            "updated_at": (_ensure_utc(model.updated_at) or _utcnow()).isoformat(),
-            "expires_at": (_ensure_utc(model.expires_at) or _utcnow()).isoformat(),
-            "completed_at": (_ensure_utc(model.completed_at).isoformat() if model.completed_at else None),
+            "provider_meta": redact_structure(_decrypt_json_maybe(model.provider_meta_json, {})),
+            "proxy_masked": mask_proxy(_decrypt_string_maybe(model.proxy, default="")),
+            "created_at": _ensure_utc(model.created_at).isoformat(),
+            "updated_at": _ensure_utc(model.updated_at).isoformat(),
+            "expires_at": _ensure_utc(model.expires_at).isoformat(),
+            "completed_at": _ensure_utc(model.completed_at).isoformat() if model.completed_at else None,
         }
 
     def _get_provider_config_model(
@@ -945,30 +1021,6 @@ class MailboxService:
                 raise MailboxServiceError("PROVIDER_CONFIG_DISABLED", f"provider 配置已禁用: {model.name}")
             session.expunge(model)
             return model
-
-    def _encrypt_string_field(self, value: str | None) -> str:
-        try:
-            return encrypt_string(value)
-        except CryptoConfigError as exc:
-            raise MailboxServiceError("ENCRYPTION_NOT_CONFIGURED", str(exc)) from exc
-
-    def _encrypt_json_field(self, value: Any) -> str:
-        try:
-            return encrypt_json(value)
-        except CryptoConfigError as exc:
-            raise MailboxServiceError("ENCRYPTION_NOT_CONFIGURED", str(exc)) from exc
-
-    def _decrypt_string_field(self, value: str | None) -> str:
-        try:
-            return decrypt_string(value, default="")
-        except CryptoConfigError as exc:
-            raise MailboxServiceError("ENCRYPTION_NOT_CONFIGURED", str(exc)) from exc
-
-    def _decrypt_json_field(self, value: str | None, default: Any) -> Any:
-        try:
-            return decrypt_json(value, default)
-        except CryptoConfigError as exc:
-            raise MailboxServiceError("ENCRYPTION_NOT_CONFIGURED", str(exc)) from exc
 
     def _map_error_code(self, exc: Exception) -> str:
         text = str(exc or "").strip().lower()

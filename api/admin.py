@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
-
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
@@ -18,21 +16,34 @@ class ProviderConfigBody(BaseModel):
     enabled: bool = True
     description: str = ""
     proxy: str | None = None
-    extra: dict[str, Any] = Field(default_factory=dict)
+    extra: dict = Field(default_factory=dict)
 
 
-def _status_for_error(exc: MailboxServiceError) -> int:
-    if exc.code in {"PROVIDER_CONFIG_NOT_FOUND", "SESSION_NOT_FOUND"}:
-        return 404
-    if exc.code in {"INVALID_LEASE", "UNAUTHORIZED"}:
-        return 401
-    if exc.code == "ENCRYPTION_NOT_CONFIGURED":
-        return 503
-    return 400
+def _status_for_error(code: str) -> int:
+    mapping = {
+        "PROVIDER_CONFIG_NOT_FOUND": 404,
+        "SESSION_NOT_FOUND": 404,
+        "PROVIDER_CONFIG_NAME_EXISTS": 409,
+        "PROVIDER_CONFIG_DISABLED": 409,
+        "ENCRYPTION_NOT_CONFIGURED": 503,
+        "ENCRYPTION_ERROR": 503,
+    }
+    return mapping.get(code, 400)
 
 
 def _raise_http(exc: MailboxServiceError):
-    raise HTTPException(status_code=_status_for_error(exc), detail={"code": exc.code, "message": exc.message})
+    raise HTTPException(status_code=_status_for_error(exc.code), detail={"code": exc.code, "message": exc.message})
+
+
+def _parse_optional_bool(value: str | None) -> bool | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise HTTPException(status_code=400, detail={"code": "INVALID_BOOLEAN", "message": f"invalid boolean value: {value}"})
 
 
 @router.get("/provider-catalog")
@@ -43,20 +54,23 @@ def admin_provider_catalog(_access: AdminAccessContext = Depends(verify_admin_ac
 @router.get("/provider-configs")
 def list_provider_configs(
     q: str = Query(default=""),
-    provider: str | None = Query(default=None),
-    enabled: bool | None = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=200),
+    provider: str = Query(default=""),
+    enabled: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     _access: AdminAccessContext = Depends(verify_admin_access),
 ):
-    items = mailbox_service.list_provider_configs(
-        q=q,
-        provider=provider,
-        enabled=enabled,
-        limit=limit,
-        offset=offset,
-    )
-    return {"items": items, "total": len(items)}
+    try:
+        items = mailbox_service.list_provider_configs(
+            q=q,
+            provider=provider or None,
+            enabled=_parse_optional_bool(enabled),
+            limit=limit,
+            offset=offset,
+        )
+    except MailboxServiceError as exc:
+        _raise_http(exc)
+    return {"items": items, "offset": offset, "limit": limit}
 
 
 @router.post("/provider-configs")
@@ -136,17 +150,22 @@ def validate_saved_provider_config(
 @router.get("/recent-sessions")
 def recent_sessions(
     q: str = Query(default=""),
-    provider: str | None = Query(default=None),
-    state: str | None = Query(default=None),
+    provider: str = Query(default=""),
+    state: str = Query(default=""),
+    result: str = Query(default=""),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     _access: AdminAccessContext = Depends(verify_admin_access),
 ):
-    items = mailbox_service.list_recent_sessions(
-        q=q,
-        provider=provider,
-        state=state,
-        limit=limit,
-        offset=offset,
-    )
-    return {"items": items, "total": len(items)}
+    try:
+        items = mailbox_service.list_recent_sessions(
+            q=q,
+            provider=provider or None,
+            state=state or None,
+            result=result or None,
+            limit=limit,
+            offset=offset,
+        )
+    except MailboxServiceError as exc:
+        _raise_http(exc)
+    return {"items": items, "offset": offset, "limit": limit}

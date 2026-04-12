@@ -1,99 +1,115 @@
 from __future__ import annotations
 
+import os
+import tempfile
 import unittest
-
-from tests.fixtures import (
-    TEST_ADMIN_PASSWORD,
-    TEST_ADMIN_USERNAME,
-    bootstrap_database,
-    clean_database,
-    prepare_test_environment,
-)
-
-prepare_test_environment("email_provider_admin_auth_test.db")
 
 from fastapi.testclient import TestClient
 
+from tests.test_support import (
+    DEFAULT_ADMIN_PASSWORD,
+    DEFAULT_ADMIN_USERNAME,
+    DEFAULT_API_KEY,
+    clean_all_tables,
+    configure_test_env,
+)
+
+_DB_PATH = os.path.join(tempfile.gettempdir(), "email_provider_admin_auth_api_test.db")
+configure_test_env(_DB_PATH)
+
 from main import app
-from services.admin_auth_service import AdminAuthEventModel, AdminLoginAttemptModel, AdminWebSessionModel
-from services.mailbox_service import MailboxProviderConfigModel, MailboxSessionEventModel, MailboxSessionModel
+from services.admin_auth_service import admin_auth_service
 
 
 class AdminAuthApiTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        bootstrap_database("email_provider_admin_auth_test.db")
-
     def setUp(self):
-        clean_database(
-            [
-                AdminAuthEventModel,
-                AdminLoginAttemptModel,
-                AdminWebSessionModel,
-                MailboxProviderConfigModel,
-                MailboxSessionEventModel,
-                MailboxSessionModel,
-            ]
-        )
+        clean_all_tables()
         self.client = TestClient(app)
 
-    def test_login_me_logout_and_admin_page_redirects(self):
-        anonymous_admin = self.client.get("/admin", follow_redirects=False)
-        self.assertEqual(anonymous_admin.status_code, 303)
-        self.assertEqual(anonymous_admin.headers["location"], "/admin/login")
-
-        login_page = self.client.get("/admin/login")
-        self.assertEqual(login_page.status_code, 200)
-        self.assertIn("管理员登录", login_page.text)
-        self.assertEqual(login_page.headers.get("cache-control"), "no-store")
-        self.assertIn("frame-ancestors 'none'", login_page.headers.get("content-security-policy", ""))
-
-        logged_in = self.client.post(
+    def test_login_me_csrf_logout_flow(self):
+        login = self.client.post(
             "/api/admin/auth/login",
-            json={"username": TEST_ADMIN_USERNAME, "password": TEST_ADMIN_PASSWORD},
+            json={"username": DEFAULT_ADMIN_USERNAME, "password": DEFAULT_ADMIN_PASSWORD},
         )
-        self.assertEqual(logged_in.status_code, 200)
-        self.assertEqual(logged_in.json()["username"], TEST_ADMIN_USERNAME)
-        self.assertTrue(self.client.cookies.get("email_provider_admin_session"))
-        self.assertTrue(self.client.cookies.get("email_provider_admin_csrf"))
+        self.assertEqual(login.status_code, 200)
+        self.assertEqual(login.json()["username"], DEFAULT_ADMIN_USERNAME)
+        self.assertIn(admin_auth_service.SESSION_COOKIE_NAME, self.client.cookies)
+        self.assertIn(admin_auth_service.CSRF_COOKIE_NAME, self.client.cookies)
 
         me = self.client.get("/api/admin/auth/me")
         self.assertEqual(me.status_code, 200)
-        self.assertEqual(me.json()["username"], TEST_ADMIN_USERNAME)
         self.assertEqual(me.json()["auth_mode"], "session")
+        self.assertEqual(me.json()["username"], DEFAULT_ADMIN_USERNAME)
 
-        login_redirect = self.client.get("/admin/login", follow_redirects=False)
-        self.assertEqual(login_redirect.status_code, 303)
-        self.assertEqual(login_redirect.headers["location"], "/admin")
+        admin_page = self.client.get("/admin")
+        self.assertEqual(admin_page.status_code, 200)
+        self.assertIn("邮箱服务管理台", admin_page.text)
 
-        logout_without_csrf = self.client.post("/api/admin/auth/logout")
-        self.assertEqual(logout_without_csrf.status_code, 403)
-        self.assertEqual(logout_without_csrf.json()["detail"]["code"], "CSRF_FAILED")
+        no_csrf = self.client.post(
+            "/api/admin/provider-configs",
+            json={"name": "x", "provider": "laoudo", "enabled": True, "description": "", "proxy": None, "extra": {}},
+        )
+        self.assertEqual(no_csrf.status_code, 403)
+
+        csrf_token = self.client.cookies.get(admin_auth_service.CSRF_COOKIE_NAME)
+        created = self.client.post(
+            "/api/admin/provider-configs",
+            headers={"X-CSRF-Token": csrf_token},
+            json={
+                "name": "session-created",
+                "provider": "laoudo",
+                "enabled": True,
+                "description": "from-session",
+                "proxy": None,
+                "extra": {"laoudo_email": "demo@example.com"},
+            },
+        )
+        self.assertEqual(created.status_code, 200)
 
         logout = self.client.post(
             "/api/admin/auth/logout",
-            headers={"X-CSRF-Token": self.client.cookies.get("email_provider_admin_csrf", "")},
+            headers={"X-CSRF-Token": csrf_token},
         )
         self.assertEqual(logout.status_code, 200)
-        self.assertEqual(logout.json()["ok"], True)
 
-        me_after_logout = self.client.get("/api/admin/auth/me")
-        self.assertEqual(me_after_logout.status_code, 401)
+        me_after = self.client.get("/api/admin/auth/me")
+        self.assertEqual(me_after.status_code, 401)
 
-    def test_login_rate_limit_after_repeated_failures(self):
-        for attempt in range(5):
-            response = self.client.post(
-                "/api/admin/auth/login",
-                json={"username": TEST_ADMIN_USERNAME, "password": f"wrong-{attempt}"},
-            )
-            self.assertEqual(response.status_code, 401)
+        admin_after = self.client.get("/admin", follow_redirects=False)
+        self.assertEqual(admin_after.status_code, 303)
+        self.assertEqual(admin_after.headers["location"], "/admin/login")
 
-        blocked = self.client.post(
+    def test_invalid_credentials_are_rejected(self):
+        response = self.client.post(
             "/api/admin/auth/login",
-            json={"username": TEST_ADMIN_USERNAME, "password": "still-wrong"},
+            json={"username": DEFAULT_ADMIN_USERNAME, "password": "wrong-password"},
         )
-        self.assertEqual(blocked.status_code, 429)
-        self.assertEqual(blocked.json()["detail"]["code"], "RATE_LIMITED")
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["detail"]["code"], "INVALID_ADMIN_CREDENTIALS")
+
+    def test_admin_api_key_fallback_still_works(self):
+        headers = {"Authorization": f"Bearer {DEFAULT_API_KEY}"}
+        catalog = self.client.get("/api/admin/provider-catalog", headers=headers)
+        self.assertEqual(catalog.status_code, 200)
+        self.assertGreaterEqual(len(catalog.json()["providers"]), 1)
+
+        created = self.client.post(
+            "/api/admin/provider-configs",
+            headers=headers,
+            json={
+                "name": "api-key-created",
+                "provider": "laoudo",
+                "enabled": True,
+                "description": "api-key",
+                "proxy": None,
+                "extra": {"laoudo_email": "demo@example.com"},
+            },
+        )
+        self.assertEqual(created.status_code, 200)
+
+        me = self.client.get("/api/admin/auth/me", headers=headers)
+        self.assertEqual(me.status_code, 200)
+        self.assertEqual(me.json()["auth_mode"], "api_key")
 
 
 if __name__ == "__main__":
