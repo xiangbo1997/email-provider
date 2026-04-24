@@ -81,6 +81,7 @@ class MailboxSessionModel(SQLModel, table=True):
     lease_token: str = ""
     lease_token_hash: str = Field(default="", index=True)
     provider: str = Field(index=True)
+    session_mode: str = Field(default="managed", index=True)
     email: str = Field(index=True)
     account_id: str = ""
     purpose: str = ""
@@ -132,6 +133,7 @@ class MailboxLease:
     lease_token: str
     provider: str
     email: str
+    session_mode: str = "managed"
     account_id: str = ""
     state: str = "leased"
     expires_at: datetime = field(default_factory=lambda: _utcnow() + timedelta(minutes=15))
@@ -309,6 +311,116 @@ PROVIDER_CATALOG: dict[str, dict[str, Any]] = {
     },
 }
 
+SESSION_MODE_MANAGED = "managed"
+SESSION_MODE_CREDENTIALED = "credentialed"
+SUPPORTED_SESSION_MODES = (SESSION_MODE_MANAGED, SESSION_MODE_CREDENTIALED)
+
+PROVIDER_SESSION_METADATA: dict[str, dict[str, Any]] = {
+    "laoudo": {
+        "supported_session_modes": [SESSION_MODE_MANAGED],
+        "default_session_mode": SESSION_MODE_MANAGED,
+        "capabilities": ["fixed_account", "provider_managed"],
+        "required_fields_by_mode": {
+            SESSION_MODE_MANAGED: ["laoudo_auth", "laoudo_email", "laoudo_account_id"],
+        },
+        "notes": "依赖已配置的固定邮箱账号，由服务端持有账号上下文。",
+    },
+    "tempmail_lol": {
+        "supported_session_modes": [SESSION_MODE_MANAGED],
+        "default_session_mode": SESSION_MODE_MANAGED,
+        "capabilities": ["auto_allocate"],
+        "required_fields_by_mode": {},
+        "notes": "无需预置账号，服务端自动生成临时邮箱。",
+    },
+    "skymail": {
+        "supported_session_modes": [SESSION_MODE_MANAGED],
+        "default_session_mode": SESSION_MODE_MANAGED,
+        "capabilities": ["auto_allocate"],
+        "required_fields_by_mode": {
+            SESSION_MODE_MANAGED: ["skymail_api_base", "skymail_token", "skymail_domain"],
+        },
+        "notes": "由服务端调用 provider API 创建新邮箱。",
+    },
+    "duckmail": {
+        "supported_session_modes": [SESSION_MODE_MANAGED],
+        "default_session_mode": SESSION_MODE_MANAGED,
+        "capabilities": ["auto_allocate"],
+        "required_fields_by_mode": {
+            SESSION_MODE_MANAGED: ["duckmail_api_url", "duckmail_provider_url"],
+        },
+        "notes": "由服务端注册新账号并轮询验证码。",
+    },
+    "freemail": {
+        "supported_session_modes": [SESSION_MODE_MANAGED],
+        "default_session_mode": SESSION_MODE_MANAGED,
+        "capabilities": ["auto_allocate"],
+        "required_fields_by_mode": {
+            SESSION_MODE_MANAGED: ["freemail_api_url"],
+        },
+        "notes": "由服务端登录/调用 Freemail 风格接口生成邮箱。",
+    },
+    "moemail": {
+        "supported_session_modes": [SESSION_MODE_MANAGED],
+        "default_session_mode": SESSION_MODE_MANAGED,
+        "capabilities": ["auto_allocate"],
+        "required_fields_by_mode": {
+            SESSION_MODE_MANAGED: ["moemail_api_url"],
+        },
+        "notes": "由服务端调用 MoeMail 风格接口分配邮箱。",
+    },
+    "maliapi": {
+        "supported_session_modes": [SESSION_MODE_MANAGED],
+        "default_session_mode": SESSION_MODE_MANAGED,
+        "capabilities": ["auto_allocate"],
+        "required_fields_by_mode": {
+            SESSION_MODE_MANAGED: ["maliapi_base_url", "maliapi_api_key"],
+        },
+        "notes": "由服务端通过 MaliAPI 创建/分配邮箱。",
+    },
+    "cfworker": {
+        "supported_session_modes": [SESSION_MODE_MANAGED],
+        "default_session_mode": SESSION_MODE_MANAGED,
+        "capabilities": ["auto_allocate"],
+        "required_fields_by_mode": {
+            SESSION_MODE_MANAGED: ["cfworker_api_url"],
+        },
+        "notes": "由服务端调用 CF Worker 接口创建或分配邮箱。",
+    },
+    "luckmail": {
+        "supported_session_modes": [SESSION_MODE_MANAGED, SESSION_MODE_CREDENTIALED],
+        "default_session_mode": SESSION_MODE_MANAGED,
+        "capabilities": ["auto_allocate", "existing_token"],
+        "required_fields_by_mode": {
+            SESSION_MODE_MANAGED: ["luckmail_base_url", "luckmail_api_key"],
+            SESSION_MODE_CREDENTIALED: ["existing_account.email", "existing_account.account_id"],
+        },
+        "notes": "同时支持服务端分配邮箱与调用方传入既有 token/邮箱上下文。",
+    },
+    "qqemail": {
+        "supported_session_modes": [SESSION_MODE_MANAGED],
+        "default_session_mode": SESSION_MODE_MANAGED,
+        "capabilities": ["auto_allocate"],
+        "required_fields_by_mode": {
+            SESSION_MODE_MANAGED: ["qqemail_api_url", "qqemail_username", "qqemail_password"],
+        },
+        "notes": "由服务端登录后生成临时邮箱。",
+    },
+    "applemail": {
+        "supported_session_modes": [SESSION_MODE_MANAGED, SESSION_MODE_CREDENTIALED],
+        "default_session_mode": SESSION_MODE_MANAGED,
+        "capabilities": ["account_pool", "existing_account", "supports_preserve_existing_mail"],
+        "required_fields_by_mode": {
+            SESSION_MODE_MANAGED: ["applemail_accounts"],
+            SESSION_MODE_CREDENTIALED: [
+                "existing_account.email",
+                "existing_account.credentials.client_id",
+                "existing_account.credentials.refresh_token",
+            ],
+        },
+        "notes": "可使用后台账号池轮转，也可由调用方指定邮箱并传入匹配的 OAuth 凭据。",
+    },
+}
+
 
 class MailboxService:
     SUPPORTED_PROVIDERS = (
@@ -336,21 +448,88 @@ class MailboxService:
         if "lease_token_hash" not in columns:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE mailbox_service_sessions ADD COLUMN lease_token_hash VARCHAR DEFAULT ''"))
+        if "session_mode" not in columns:
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "ALTER TABLE mailbox_service_sessions ADD COLUMN session_mode VARCHAR DEFAULT 'managed'"
+                    )
+                )
+
+    def provider_session_profile(self, provider: str) -> dict[str, Any]:
+        self.validate_provider(provider)
+        spec = dict(PROVIDER_CATALOG.get(provider, {}))
+        meta = dict(PROVIDER_SESSION_METADATA.get(provider, {}))
+        supported = list(meta.get("supported_session_modes") or [SESSION_MODE_MANAGED])
+        default_mode = str(meta.get("default_session_mode") or supported[0]).strip() or supported[0]
+        required_by_mode = dict(meta.get("required_fields_by_mode") or {})
+        capabilities = list(meta.get("capabilities") or [])
+        notes = str(meta.get("notes") or "")
+        return {
+            "supported_session_modes": supported,
+            "default_session_mode": default_mode,
+            "capabilities": capabilities,
+            "required_fields_by_mode": required_by_mode,
+            "notes": notes,
+            "description": str(spec.get("description") or ""),
+            "fields": list(spec.get("fields") or []),
+            "example_extra": dict(spec.get("example_extra") or {}),
+        }
+
+    def default_session_mode_for_provider(self, provider: str) -> str:
+        return str(self.provider_session_profile(provider)["default_session_mode"])
+
+    def supports_session_mode(self, provider: str, session_mode: str) -> bool:
+        normalized = str(session_mode or "").strip().lower()
+        if normalized not in SUPPORTED_SESSION_MODES:
+            return False
+        profile = self.provider_session_profile(provider)
+        return normalized in set(profile.get("supported_session_modes") or [])
+
+    def normalize_session_mode(self, provider: str, session_mode: str | None = None) -> str:
+        normalized = str(session_mode or "").strip().lower()
+        if not normalized:
+            normalized = self.default_session_mode_for_provider(provider)
+        if normalized not in SUPPORTED_SESSION_MODES:
+            raise MailboxServiceError("UNSUPPORTED_SESSION_MODE", f"不支持的 session_mode: {session_mode}")
+        if not self.supports_session_mode(provider, normalized):
+            raise MailboxServiceError(
+                "UNSUPPORTED_SESSION_MODE",
+                f"provider={provider} 不支持 session_mode={normalized}",
+            )
+        return normalized
 
     def list_providers(self) -> list[dict[str, Any]]:
-        return [{"name": name, "mode": "legacy_adapter"} for name in self.SUPPORTED_PROVIDERS]
-
-    def provider_catalog(self) -> list[dict[str, Any]]:
         items = []
         for name in self.SUPPORTED_PROVIDERS:
-            spec = PROVIDER_CATALOG.get(name, {})
+            profile = self.provider_session_profile(name)
             items.append(
                 {
                     "name": name,
                     "mode": "legacy_adapter",
-                    "description": str(spec.get("description") or ""),
-                    "fields": list(spec.get("fields") or []),
-                    "example_extra": dict(spec.get("example_extra") or {}),
+                    "default_session_mode": profile["default_session_mode"],
+                    "supported_session_modes": profile["supported_session_modes"],
+                    "capabilities": profile["capabilities"],
+                }
+            )
+        return items
+
+    def provider_catalog(self) -> list[dict[str, Any]]:
+        items = []
+        for name in self.SUPPORTED_PROVIDERS:
+            profile = self.provider_session_profile(name)
+            items.append(
+                {
+                    "name": name,
+                    "mode": "legacy_adapter",
+                    "description": profile["description"],
+                    "fields": profile["fields"],
+                    "example_extra": profile["example_extra"],
+                    "supported_session_modes": profile["supported_session_modes"],
+                    "default_session_mode": profile["default_session_mode"],
+                    "capabilities": profile["capabilities"],
+                    "required_fields_by_mode": profile["required_fields_by_mode"],
+                    "notes": profile["notes"],
                 }
             )
         return items
@@ -622,6 +801,7 @@ class MailboxService:
         self,
         *,
         provider: str,
+        session_mode: str = SESSION_MODE_MANAGED,
         extra: Optional[dict[str, Any]] = None,
         proxy: Optional[str] = None,
         purpose: str = "generic",
@@ -629,6 +809,9 @@ class MailboxService:
         lease_seconds: int = 900,
     ) -> MailboxLease:
         self.validate_provider(provider)
+        resolved_session_mode = self.normalize_session_mode(provider, session_mode)
+        if resolved_session_mode == SESSION_MODE_CREDENTIALED and account_override is None:
+            raise MailboxServiceError("CREDENTIAL_REQUIRED", "credentialed 会话模式必须提供 existing_account")
         extra = dict(extra or {})
         mailbox = self._create_local_mailbox(provider=provider, extra=extra, proxy=proxy)
 
@@ -661,6 +844,7 @@ class MailboxService:
             session_id=uuid.uuid4().hex,
             lease_token=secrets.token_urlsafe(24),
             provider=provider,
+            session_mode=resolved_session_mode,
             email=account.email,
             account_id=str(account.account_id or ""),
             state="leased",
@@ -675,6 +859,7 @@ class MailboxService:
                     lease_token="",
                     lease_token_hash=hash_token(lease.lease_token),
                     provider=provider,
+                    session_mode=resolved_session_mode,
                     email=lease.email,
                     account_id=lease.account_id,
                     purpose=str(purpose or "generic"),
@@ -694,7 +879,12 @@ class MailboxService:
         self._record_event(
             lease.session_id,
             "created",
-            {"email": lease.email, "provider": provider, "provider_meta": redact_structure(provider_meta)},
+            {
+                "email": lease.email,
+                "provider": provider,
+                "session_mode": resolved_session_mode,
+                "provider_meta": redact_structure(provider_meta),
+            },
         )
         return lease
 
@@ -829,6 +1019,8 @@ class MailboxService:
             account_id=model.account_id or "",
             extra=account_extra or None,
         )
+        if account.extra:
+            self._prepare_known_account(mailbox, account)
         return mailbox, account, before_ids
 
     def _create_local_mailbox(self, *, provider: str, extra: dict[str, Any], proxy: Optional[str]):
@@ -867,8 +1059,41 @@ class MailboxService:
                     pass
                 return
 
+    def _prepare_dynamic_applemail_account(self, mailbox, account) -> None:
+        accounts = getattr(mailbox, "_accounts", None)
+        extra = dict(getattr(account, "extra", None) or {})
+        email = str(getattr(account, "email", "") or "").strip()
+        client_id = str(extra.get("client_id") or extra.get("mail_client_id") or "").strip()
+        refresh_token = str(extra.get("refresh_token") or extra.get("mail_refresh_token") or "").strip()
+        if not isinstance(accounts, list) or not email or not client_id or not refresh_token:
+            return
+
+        # applemail 已知邮箱接管模式下，允许业务端直接补齐最小凭据上下文，
+        # 避免必须预先在后台保存整份账号池配置才能拉取当前邮箱验证码。
+        dynamic_account = {
+            "email": email,
+            "password": str(extra.get("password") or "unused").strip(),
+            "client_id": client_id,
+            "refresh_token": refresh_token,
+            "raw": f"{email}----{str(extra.get('password') or 'unused').strip()}----{client_id}----{refresh_token}",
+        }
+        for item in accounts:
+            if str((item or {}).get("email", "")).strip().lower() == email.lower():
+                item.update(dynamic_account)
+                dynamic_account = item
+                break
+        else:
+            accounts.append(dynamic_account)
+
+        try:
+            mailbox._selected = dynamic_account
+        except Exception:
+            pass
+
     def _prepare_known_account(self, mailbox, account) -> None:
         self._prepare_selected_account(mailbox, account.email)
+        if not getattr(mailbox, "_selected", None):
+            self._prepare_dynamic_applemail_account(mailbox, account)
 
         account_id = str(account.account_id or "").strip()
         if account_id and hasattr(mailbox, "_token"):
@@ -883,7 +1108,8 @@ class MailboxService:
                 pass
 
         selected = getattr(mailbox, "_selected", None)
-        if selected and hasattr(mailbox, "_clear_mailbox"):
+        preserve_existing_mail = bool(dict(getattr(account, "extra", None) or {}).get("preserve_existing_mail"))
+        if selected and hasattr(mailbox, "_clear_mailbox") and not preserve_existing_mail:
             try:
                 mailbox._clear_mailbox(selected)
             except Exception:
@@ -938,6 +1164,7 @@ class MailboxService:
             session_id=model.session_id,
             lease_token=str(lease_token or ""),
             provider=model.provider,
+            session_mode=str(model.session_mode or SESSION_MODE_MANAGED),
             email=model.email,
             account_id=model.account_id or "",
             state=model.state,
@@ -950,6 +1177,7 @@ class MailboxService:
         if model is None:
             return None
         proxy = _decrypt_string_maybe(model.proxy, default="")
+        profile = self.provider_session_profile(model.provider)
         return {
             "id": model.id,
             "name": model.name,
@@ -958,6 +1186,11 @@ class MailboxService:
             "description": model.description,
             "proxy_configured": bool(proxy),
             "proxy_masked": mask_proxy(proxy) if proxy else "",
+            "supported_session_modes": profile["supported_session_modes"],
+            "default_session_mode": profile["default_session_mode"],
+            "capabilities": profile["capabilities"],
+            "required_fields_by_mode": profile["required_fields_by_mode"],
+            "notes": profile["notes"],
             "created_at": _ensure_utc(model.created_at).isoformat(),
             "updated_at": _ensure_utc(model.updated_at).isoformat(),
             "last_validated_at": _ensure_utc(model.last_validated_at).isoformat() if model.last_validated_at else None,
@@ -984,6 +1217,7 @@ class MailboxService:
         return {
             "session_id": model.session_id,
             "provider": model.provider,
+            "session_mode": str(model.session_mode or SESSION_MODE_MANAGED),
             "email": model.email,
             "purpose": model.purpose,
             "state": model.state,

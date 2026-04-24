@@ -110,6 +110,14 @@ class AdminApiTests(unittest.TestCase):
         missing = self.client.get(f"/api/admin/provider-configs/{config_id}", headers=self.headers)
         self.assertEqual(missing.status_code, 404)
 
+    def test_provider_catalog_includes_session_metadata(self):
+        response = self.client.get("/api/admin/provider-catalog", headers=self.headers)
+
+        self.assertEqual(response.status_code, 200)
+        catalog = {item["name"]: item for item in response.json()["providers"]}
+        self.assertEqual(catalog["applemail"]["default_session_mode"], "managed")
+        self.assertIn("credentialed", catalog["applemail"]["supported_session_modes"])
+
     def test_session_api_accepts_saved_config_id_and_recent_sessions_redacts(self):
         with mock.patch("core.base_mailbox.create_local_mailbox", return_value=_FakeMailbox()):
             created = self.client.post(
@@ -139,6 +147,7 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(session_resp.status_code, 200)
         body = session_resp.json()
         self.assertEqual(body["provider"], "laoudo")
+        self.assertEqual(body["session_mode"], "managed")
         self.assertEqual(body["provider_config"]["id"], config_id)
         self.assertNotIn("extra", body["provider_config"])
         self.assertEqual(body["email"], "demo@example.com")
@@ -152,10 +161,82 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(len(recent.json()["items"]), 1)
         item = recent.json()["items"][0]
         self.assertEqual(item["provider"], "laoudo")
+        self.assertEqual(item["session_mode"], "managed")
         self.assertEqual(item["state"], "leased")
         self.assertIn("provider_meta", item)
         self.assertEqual(item["provider_meta"]["mailbox_token"], "***")
         self.assertIn("proxy_masked", item)
+
+    def test_managed_and_credentialed_session_endpoints(self):
+        fake_mailbox = _FakeMailbox()
+        fake_mailbox._accounts = []
+        fake_mailbox._selected = {}
+        fake_mailbox._clear_mailbox = mock.Mock()
+        with mock.patch("core.base_mailbox.create_local_mailbox", return_value=fake_mailbox):
+            managed = self.client.post(
+                "/api/mailbox-service/managed-sessions",
+                headers=self.headers,
+                json={"provider": "laoudo", "purpose": "register", "lease_seconds": 120, "extra": {}},
+            )
+            credentialed = self.client.post(
+                "/api/mailbox-service/credentialed-sessions",
+                headers=self.headers,
+                json={
+                    "provider": "applemail",
+                    "purpose": "otp",
+                    "existing_account": {
+                        "email": "known@example.com",
+                        "preserve_existing_mail": True,
+                        "credentials": {
+                            "client_id": "cid-known",
+                            "refresh_token": "rt-known",
+                            "password": "unused",
+                        },
+                    },
+                },
+            )
+
+        self.assertEqual(managed.status_code, 200)
+        self.assertEqual(managed.json()["session_mode"], "managed")
+        self.assertEqual(credentialed.status_code, 200)
+        self.assertEqual(credentialed.json()["session_mode"], "credentialed")
+        self.assertEqual(credentialed.json()["email"], "known@example.com")
+
+    def test_credentialed_session_requires_applemail_credentials(self):
+        response = self.client.post(
+            "/api/mailbox-service/credentialed-sessions",
+            headers=self.headers,
+            json={
+                "provider": "applemail",
+                "existing_account": {"email": "known@example.com"},
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"]["code"], "INVALID_EXISTING_ACCOUNT")
+
+    def test_legacy_sessions_endpoint_infers_credentialed_mode(self):
+        fake_mailbox = _FakeMailbox()
+        fake_mailbox._accounts = []
+        fake_mailbox._selected = {}
+        fake_mailbox._clear_mailbox = mock.Mock()
+        with mock.patch("core.base_mailbox.create_local_mailbox", return_value=fake_mailbox):
+            response = self.client.post(
+                "/api/mailbox-service/sessions",
+                headers=self.headers,
+                json={
+                    "provider": "applemail",
+                    "email": "known@example.com",
+                    "account_extra": {
+                        "client_id": "cid-known",
+                        "refresh_token": "rt-known",
+                        "preserve_existing_mail": True,
+                    },
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["session_mode"], "credentialed")
 
 
 if __name__ == "__main__":

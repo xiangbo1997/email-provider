@@ -50,6 +50,23 @@ class _FakeMailbox:
         self._removed = True
 
 
+class _FakeDynamicAppleMailBox(_FakeMailbox):
+    def __init__(self, *, code: str = "123456"):
+        super().__init__(code=code)
+        self._accounts = []
+        self._selected = {}
+        self._clear_mailbox = mock.Mock()
+
+    def wait_for_code(self, account: MailboxAccount, **kwargs) -> str:
+        selected = next(
+            (item for item in self._accounts if item.get("email", "").lower() == account.email.lower()),
+            self._selected or None,
+        )
+        if not selected:
+            raise RuntimeError(f"未找到 {account.email} 的 AppleMail 账号配置")
+        return self._code
+
+
 class MailboxServiceTests(unittest.TestCase):
     def setUp(self):
         clean_all_tables()
@@ -159,6 +176,16 @@ class MailboxServiceTests(unittest.TestCase):
             )
             self.assertEqual(lease.email, "demo@example.com")
 
+    def test_provider_catalog_exposes_session_metadata(self):
+        catalog = {item["name"]: item for item in mailbox_service.provider_catalog()}
+
+        self.assertEqual(catalog["applemail"]["default_session_mode"], "managed")
+        self.assertIn("credentialed", catalog["applemail"]["supported_session_modes"])
+        self.assertIn(
+            "existing_account.credentials.refresh_token",
+            catalog["applemail"]["required_fields_by_mode"]["credentialed"],
+        )
+
     def test_legacy_plaintext_lease_token_still_works(self):
         fake_mailbox = _FakeMailbox(code="777777")
         with mock.patch("core.base_mailbox.create_local_mailbox", return_value=fake_mailbox):
@@ -178,6 +205,87 @@ class MailboxServiceTests(unittest.TestCase):
             )
             self.assertEqual(result.status, "ready")
             self.assertEqual(result.code, "777777")
+
+    def test_known_applemail_account_extra_can_bootstrap_runtime_context(self):
+        fake_mailbox = _FakeMailbox(code="246810")
+        fake_mailbox._accounts = []
+        fake_mailbox._selected = {}
+        fake_mailbox._clear_mailbox = mock.Mock()
+        with mock.patch("core.base_mailbox.create_local_mailbox", return_value=fake_mailbox):
+            lease = mailbox_service.acquire_session(
+                provider="applemail",
+                session_mode="credentialed",
+                extra={},
+                proxy=None,
+                purpose="register",
+                account_override=MailboxAccount(
+                    email="known@example.com",
+                    account_id="",
+                    extra={
+                        "client_id": "cid-known",
+                        "refresh_token": "rt-known",
+                        "preserve_existing_mail": True,
+                    },
+                ),
+            )
+
+        self.assertEqual(lease.email, "known@example.com")
+        self.assertEqual(lease.session_mode, "credentialed")
+        self.assertEqual(fake_mailbox._selected["email"], "known@example.com")
+        self.assertEqual(fake_mailbox._selected["client_id"], "cid-known")
+        self.assertEqual(fake_mailbox._selected["refresh_token"], "rt-known")
+        self.assertTrue(any(item["email"] == "known@example.com" for item in fake_mailbox._accounts))
+        fake_mailbox._clear_mailbox.assert_not_called()
+        with Session(engine()) as session:
+            model = session.get(MailboxSessionModel, lease.session_id)
+            self.assertEqual(model.session_mode, "credentialed")
+
+    def test_credentialed_mode_requires_existing_account(self):
+        fake_mailbox = _FakeMailbox()
+        with mock.patch("core.base_mailbox.create_local_mailbox", return_value=fake_mailbox):
+            with self.assertRaisesRegex(Exception, "existing_account"):
+                mailbox_service.acquire_session(
+                    provider="applemail",
+                    session_mode="credentialed",
+                    extra={},
+                    proxy=None,
+                    purpose="register",
+                )
+
+    def test_credentialed_poll_code_rehydrates_dynamic_applemail_account(self):
+        acquire_mailbox = _FakeDynamicAppleMailBox(code="246810")
+        poll_mailbox = _FakeDynamicAppleMailBox(code="246810")
+        with mock.patch(
+            "core.base_mailbox.create_local_mailbox",
+            side_effect=[acquire_mailbox, poll_mailbox],
+        ):
+            lease = mailbox_service.acquire_session(
+                provider="applemail",
+                session_mode="credentialed",
+                extra={},
+                proxy=None,
+                purpose="register",
+                account_override=MailboxAccount(
+                    email="known@example.com",
+                    account_id="",
+                    extra={
+                        "client_id": "cid-known",
+                        "refresh_token": "rt-known",
+                        "preserve_existing_mail": True,
+                    },
+                ),
+            )
+            result = mailbox_service.poll_code(
+                session_id=lease.session_id,
+                lease_token=lease.lease_token,
+                timeout_seconds=10,
+                before_ids=set(lease.before_ids),
+            )
+
+        self.assertEqual(result.status, "ready")
+        self.assertEqual(result.code, "246810")
+        self.assertEqual(poll_mailbox._selected["email"], "known@example.com")
+        self.assertTrue(any(item["email"] == "known@example.com" for item in poll_mailbox._accounts))
 
 
 if __name__ == "__main__":

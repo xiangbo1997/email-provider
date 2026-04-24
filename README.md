@@ -88,6 +88,8 @@ python scripts/generate_admin_password_hash.py --generate-data-key
 - `GET /api/mailbox-service/health`
 - `GET /api/mailbox-service/providers`
 - `POST /api/mailbox-service/providers/{provider}/validate-config`
+- `POST /api/mailbox-service/managed-sessions`
+- `POST /api/mailbox-service/credentialed-sessions`
 - `POST /api/mailbox-service/sessions`
 - `GET /api/mailbox-service/sessions/{session_id}`
 - `POST /api/mailbox-service/sessions/{session_id}/poll-code`

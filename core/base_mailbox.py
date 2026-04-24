@@ -2044,43 +2044,67 @@ class AppleMailMailbox(BaseMailbox):
         except Exception:
             return dated_items[0]
 
-    def _fetch_latest(self, account: dict, mailbox: str) -> dict:
+    def _coerce_mail_items(self, data) -> list[dict]:
+        if isinstance(data, dict):
+            inner = data.get("data")
+            if isinstance(inner, dict):
+                return [inner]
+            if isinstance(inner, list):
+                return [item for item in inner if isinstance(item, dict)]
+            if not data.get("success", True):
+                self._log(f"[AppleMail] 无新邮件: {data.get('msg', '')}")
+            return []
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        return []
+
+    def _request_mail_api(self, account: dict, mailbox: str, endpoint: str, *, response_type: str | None = None):
         try:
             session = self._session()
+            params = {
+                "refresh_token": account["refresh_token"],
+                "client_id": account["client_id"],
+                "email": account["email"],
+                "mailbox": mailbox,
+            }
+            if response_type is not None:
+                params["response_type"] = response_type
             resp = session.get(
-                f"{self._API_BASE}/api/mail-new",
-                params={
-                    "refresh_token": account["refresh_token"],
-                    "client_id": account["client_id"],
-                    "email": account["email"],
-                    "mailbox": mailbox,
-                    "response_type": "json",
-                },
+                f"{self._API_BASE}{endpoint}",
+                params=params,
                 timeout=30,
             )
             if resp.status_code != 200:
                 message = resp.text[:200]
-                self._log(f"[AppleMail] {mailbox} HTTP {resp.status_code}: {message}")
+                self._log(f"[AppleMail] {mailbox} {endpoint} HTTP {resp.status_code}: {message}")
                 lowered = message.lower()
                 if "invalid_grant" in lowered or "aadsts70000" in lowered:
                     raise RuntimeError(f"[AppleMail] {mailbox} Microsoft 凭证已失效: invalid_grant")
-                return {}
-            data = resp.json()
-            if isinstance(data, dict):
-                inner = data.get("data")
-                if inner and isinstance(inner, dict):
-                    return inner
-                if isinstance(inner, list):
-                    return self._pick_latest_mail(inner)
-                if not data.get("success", True):
-                    self._log(f"[AppleMail] {mailbox} 无新邮件: {data.get('msg', '')}")
-                return {}
-            if isinstance(data, list):
-                return self._pick_latest_mail(data)
-            return {}
+                if "user is authenticated but not connected" in lowered:
+                    raise RuntimeError(f"[AppleMail] {mailbox} AppleMail 账号已认证但未连接，请在小苹果后台重新连接邮箱")
+                if "command error. 12" in lowered:
+                    raise RuntimeError(f"[AppleMail] {mailbox} AppleMail 上游返回 Command Error. 12，当前账号状态异常")
+                return None
+            return resp.json()
+        except RuntimeError:
+            # Microsoft refresh_token / client_id 失效属于硬错误，
+            # 需要上抛给 mailbox_service 映射为 INVALID_CREDENTIAL，
+            # 不能继续被误判成普通超时。
+            raise
         except Exception as e:
-            self._log(f"[AppleMail] {mailbox} 请求异常: {e}")
+            self._log(f"[AppleMail] {mailbox} {endpoint} 请求异常: {e}")
+            return None
+
+    def _fetch_latest(self, account: dict, mailbox: str) -> dict:
+        data = self._request_mail_api(account, mailbox, "/api/mail-new", response_type="json")
+        items = self._coerce_mail_items(data)
+        if not items:
             return {}
+        return self._pick_latest_mail(items)
+
+    def _fetch_all(self, account: dict, mailbox: str) -> list[dict]:
+        data = self._request_mail_api(account, mailbox, "/api/mail-all")
+        return self._coerce_mail_items(data)
 
     def get_current_ids(self, account: MailboxAccount) -> set:
         return set()
@@ -2110,15 +2134,35 @@ class AppleMailMailbox(BaseMailbox):
 
         while time.time() < deadline:
             for mailbox in ("INBOX", "Junk"):
-                msg = self._fetch_latest(acc, mailbox)
-                if not msg:
-                    continue
-                content = msg.get("text") or msg.get("subject") or ""
-                code = self._safe_extract(content, code_pattern)
-                if code and code not in tried:
-                    tried.add(code)
-                    self._log(f"[AppleMail] 从 {mailbox} 获取到验证码 {code}")
-                    return code
+                candidates: list[dict] = []
+                latest = self._fetch_latest(acc, mailbox)
+                if latest:
+                    candidates.append(latest)
+                candidates.extend(self._fetch_all(acc, mailbox))
+
+                seen_messages: set[tuple[str, str, str]] = set()
+                for msg in sorted(
+                    [item for item in candidates if isinstance(item, dict)],
+                    key=lambda item: str(item.get("date") or ""),
+                    reverse=True,
+                ):
+                    marker = (
+                        str(msg.get("date") or ""),
+                        str(msg.get("subject") or ""),
+                        str(msg.get("id") or ""),
+                    )
+                    if marker in seen_messages:
+                        continue
+                    seen_messages.add(marker)
+
+                    code = str(msg.get("verification_code") or "").strip()
+                    if not code:
+                        content = msg.get("text") or msg.get("preview") or msg.get("subject") or ""
+                        code = self._safe_extract(content, code_pattern)
+                    if code and code not in tried:
+                        tried.add(code)
+                        self._log(f"[AppleMail] 从 {mailbox} 获取到验证码 {code}")
+                        return code
             poll_count += 1
             if poll_count % 3 == 0:
                 remaining = int(deadline - time.time())
