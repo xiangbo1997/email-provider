@@ -14,6 +14,12 @@ from services.mailbox_service import (
     mailbox_service,
 )
 
+# 业务异常 → HTTP 状态码映射统一在 main.py 的 exception_handler 注册。
+# 端点函数不再写重复 try/except MailboxServiceError。所有 mailbox-service
+# 端点抛出的 MailboxServiceError 子类（含 ProviderConfigIncompleteError /
+# ProviderUpstreamError）会被全局 handler 渲染成结构化 4xx；裸 RuntimeError
+# 由 RuntimeError handler 兜底成结构化 500，绝不再暴露 stacktrace 给客户端。
+
 
 router = APIRouter(
     prefix="/mailbox-service",
@@ -82,21 +88,6 @@ class CompleteMailboxSessionRequest(BaseModel):
 class ValidateMailboxProviderRequest(BaseModel):
     extra: dict = Field(default_factory=dict)
     proxy: str | None = None
-
-
-def _raise_http(exc: MailboxServiceError):
-    status_code = 400
-    if exc.code.endswith("_NOT_FOUND"):
-        status_code = 404
-    elif exc.code.endswith("_EXISTS"):
-        status_code = 409
-    elif exc.code in {"INVALID_LEASE"}:
-        status_code = 401
-    elif exc.code in {"LEASE_EXPIRED"}:
-        status_code = 410
-    elif exc.code in {"ENCRYPTION_NOT_CONFIGURED"}:
-        status_code = 503
-    raise HTTPException(status_code=status_code, detail={"code": exc.code, "message": exc.message})
 
 
 def _coerce_session_mode(provider: str, session_mode: str | None) -> str:
@@ -185,123 +176,116 @@ def list_mailbox_service_providers():
 
 @router.post("/providers/{provider}/validate-config")
 def validate_mailbox_service_provider(provider: str, body: ValidateMailboxProviderRequest):
+    # MailboxServiceError 由全局 handler 处理；这里仅捕获其他 Exception 转成
+    # 400 INVALID_PROVIDER_CONFIG（"配置校验失败"语义，validate-config 端点专用）。
     try:
         result = mailbox_service.validate_provider_config(
             provider=provider,
             extra=body.extra,
             proxy=body.proxy,
         )
-    except MailboxServiceError as exc:
-        _raise_http(exc)
+    except MailboxServiceError:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=400, detail={"code": "INVALID_PROVIDER_CONFIG", "message": str(exc)})
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_PROVIDER_CONFIG", "message": str(exc)},
+        )
     return result
 
 
 @router.post("/sessions")
 def create_mailbox_session(body: CreateMailboxSessionRequest):
-    try:
-        runtime = mailbox_service.resolve_provider_request(
-            provider=body.provider,
-            extra=body.extra,
-            proxy=body.proxy,
-            config_id=body.config_id,
-            config_name=body.config_name,
+    runtime = mailbox_service.resolve_provider_request(
+        provider=body.provider,
+        extra=body.extra,
+        proxy=body.proxy,
+        config_id=body.config_id,
+        config_name=body.config_name,
+    )
+    account_override = None
+    requested_mode = str(body.session_mode or "").strip().lower() or None
+    if body.existing_account is not None:
+        account_override = _build_account_override_from_existing_account(body.existing_account)
+        requested_mode = requested_mode or SESSION_MODE_CREDENTIALED
+    else:
+        account_override = _build_account_override_from_legacy_fields(
+            email=body.email,
+            account_id=body.account_id,
+            account_extra=body.account_extra,
         )
-        account_override = None
-        requested_mode = str(body.session_mode or "").strip().lower() or None
-        if body.existing_account is not None:
-            account_override = _build_account_override_from_existing_account(body.existing_account)
+        if account_override is not None:
             requested_mode = requested_mode or SESSION_MODE_CREDENTIALED
-        else:
-            account_override = _build_account_override_from_legacy_fields(
-                email=body.email,
-                account_id=body.account_id,
-                account_extra=body.account_extra,
-            )
-            if account_override is not None:
-                requested_mode = requested_mode or SESSION_MODE_CREDENTIALED
 
-        session_mode = _coerce_session_mode(runtime["provider"], requested_mode)
-        if body.existing_account is not None and session_mode != SESSION_MODE_CREDENTIALED:
-            raise MailboxServiceError("INVALID_SESSION_REQUEST", "existing_account 仅支持 credentialed 会话")
-        if session_mode == SESSION_MODE_CREDENTIALED:
-            if account_override is None:
-                raise MailboxServiceError("CREDENTIAL_REQUIRED", "credentialed 会话模式必须提供 existing_account")
-            _validate_credentialed_account(runtime["provider"], account_override)
-        else:
-            account_override = None
+    session_mode = _coerce_session_mode(runtime["provider"], requested_mode)
+    if body.existing_account is not None and session_mode != SESSION_MODE_CREDENTIALED:
+        raise MailboxServiceError("INVALID_SESSION_REQUEST", "existing_account 仅支持 credentialed 会话")
+    if session_mode == SESSION_MODE_CREDENTIALED:
+        if account_override is None:
+            raise MailboxServiceError("CREDENTIAL_REQUIRED", "credentialed 会话模式必须提供 existing_account")
+        _validate_credentialed_account(runtime["provider"], account_override)
+    else:
+        account_override = None
 
-        lease = mailbox_service.acquire_session(
-            provider=runtime["provider"],
-            session_mode=session_mode,
-            extra=runtime["extra"],
-            proxy=runtime["proxy"],
-            purpose=body.purpose,
-            account_override=account_override,
-            lease_seconds=body.lease_seconds,
-        )
-    except MailboxServiceError as exc:
-        _raise_http(exc)
+    lease = mailbox_service.acquire_session(
+        provider=runtime["provider"],
+        session_mode=session_mode,
+        extra=runtime["extra"],
+        proxy=runtime["proxy"],
+        purpose=body.purpose,
+        account_override=account_override,
+        lease_seconds=body.lease_seconds,
+    )
     return _response_from_lease(lease, runtime)
 
 
 @router.post("/managed-sessions")
 def create_managed_mailbox_session(body: ManagedMailboxSessionRequest):
-    try:
-        runtime = mailbox_service.resolve_provider_request(
-            provider=body.provider,
-            extra=body.extra,
-            proxy=body.proxy,
-            config_id=body.config_id,
-            config_name=body.config_name,
-        )
-        lease = mailbox_service.acquire_session(
-            provider=runtime["provider"],
-            session_mode=_coerce_session_mode(runtime["provider"], SESSION_MODE_MANAGED),
-            extra=runtime["extra"],
-            proxy=runtime["proxy"],
-            purpose=body.purpose,
-            lease_seconds=body.lease_seconds,
-            requested_email=str(body.email or "").strip(),
-        )
-    except MailboxServiceError as exc:
-        _raise_http(exc)
+    runtime = mailbox_service.resolve_provider_request(
+        provider=body.provider,
+        extra=body.extra,
+        proxy=body.proxy,
+        config_id=body.config_id,
+        config_name=body.config_name,
+    )
+    lease = mailbox_service.acquire_session(
+        provider=runtime["provider"],
+        session_mode=_coerce_session_mode(runtime["provider"], SESSION_MODE_MANAGED),
+        extra=runtime["extra"],
+        proxy=runtime["proxy"],
+        purpose=body.purpose,
+        lease_seconds=body.lease_seconds,
+        requested_email=str(body.email or "").strip(),
+    )
     return _response_from_lease(lease, runtime)
 
 
 @router.post("/credentialed-sessions")
 def create_credentialed_mailbox_session(body: CredentialedMailboxSessionRequest):
-    try:
-        runtime = mailbox_service.resolve_provider_request(
-            provider=body.provider,
-            extra=body.extra,
-            proxy=body.proxy,
-            config_id=body.config_id,
-            config_name=body.config_name,
-        )
-        account_override = _build_account_override_from_existing_account(body.existing_account)
-        _validate_credentialed_account(runtime["provider"], account_override)
-        lease = mailbox_service.acquire_session(
-            provider=runtime["provider"],
-            session_mode=_coerce_session_mode(runtime["provider"], SESSION_MODE_CREDENTIALED),
-            extra=runtime["extra"],
-            proxy=runtime["proxy"],
-            purpose=body.purpose,
-            account_override=account_override,
-            lease_seconds=body.lease_seconds,
-        )
-    except MailboxServiceError as exc:
-        _raise_http(exc)
+    runtime = mailbox_service.resolve_provider_request(
+        provider=body.provider,
+        extra=body.extra,
+        proxy=body.proxy,
+        config_id=body.config_id,
+        config_name=body.config_name,
+    )
+    account_override = _build_account_override_from_existing_account(body.existing_account)
+    _validate_credentialed_account(runtime["provider"], account_override)
+    lease = mailbox_service.acquire_session(
+        provider=runtime["provider"],
+        session_mode=_coerce_session_mode(runtime["provider"], SESSION_MODE_CREDENTIALED),
+        extra=runtime["extra"],
+        proxy=runtime["proxy"],
+        purpose=body.purpose,
+        account_override=account_override,
+        lease_seconds=body.lease_seconds,
+    )
     return _response_from_lease(lease, runtime)
 
 
 @router.get("/sessions/{session_id}")
 def get_mailbox_session(session_id: str):
-    try:
-        lease = mailbox_service.get_session(session_id)
-    except MailboxServiceError as exc:
-        _raise_http(exc)
+    lease = mailbox_service.get_session(session_id)
     return {
         "session_id": lease.session_id,
         "provider": lease.provider,
@@ -317,19 +301,16 @@ def get_mailbox_session(session_id: str):
 
 @router.post("/sessions/{session_id}/poll-code")
 def poll_mailbox_code(session_id: str, body: PollMailboxCodeRequest):
-    try:
-        result = mailbox_service.poll_code(
-            session_id=session_id,
-            lease_token=body.lease_token,
-            timeout_seconds=body.timeout_seconds,
-            keyword=body.keyword,
-            code_pattern=body.code_pattern,
-            otp_sent_at=body.otp_sent_at,
-            exclude_codes=set(body.exclude_codes),
-            before_ids=set(body.before_ids),
-        )
-    except MailboxServiceError as exc:
-        _raise_http(exc)
+    result = mailbox_service.poll_code(
+        session_id=session_id,
+        lease_token=body.lease_token,
+        timeout_seconds=body.timeout_seconds,
+        keyword=body.keyword,
+        code_pattern=body.code_pattern,
+        otp_sent_at=body.otp_sent_at,
+        exclude_codes=set(body.exclude_codes),
+        before_ids=set(body.before_ids),
+    )
     return {
         "status": result.status,
         "code": result.code,
@@ -341,15 +322,12 @@ def poll_mailbox_code(session_id: str, body: PollMailboxCodeRequest):
 
 @router.post("/sessions/{session_id}/complete")
 def complete_mailbox_session(session_id: str, body: CompleteMailboxSessionRequest):
-    try:
-        lease = mailbox_service.complete_session(
-            session_id=session_id,
-            lease_token=body.lease_token,
-            result=body.result,
-            reason=body.reason,
-        )
-    except MailboxServiceError as exc:
-        _raise_http(exc)
+    lease = mailbox_service.complete_session(
+        session_id=session_id,
+        lease_token=body.lease_token,
+        result=body.result,
+        reason=body.reason,
+    )
     return {
         "session_id": lease.session_id,
         "provider": lease.provider,

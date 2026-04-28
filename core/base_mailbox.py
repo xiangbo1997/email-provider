@@ -629,9 +629,19 @@ class SkyMailMailbox(BaseMailbox):
         }
 
     def _ensure_config(self) -> None:
-        if not self.api or not self.auth_token or not self.domain:
-            raise RuntimeError(
-                "SkyMail 未配置完整：请设置 skymail_api_base、skymail_token、skymail_domain"
+        missing: list[str] = []
+        if not self.api:
+            missing.append("skymail_api_base")
+        if not self.auth_token:
+            missing.append("skymail_token")
+        if not self.domain:
+            missing.append("skymail_domain")
+        if missing:
+            from services.mailbox_service import ProviderConfigIncompleteError
+
+            raise ProviderConfigIncompleteError(
+                "SkyMail 未配置完整：请设置 " + "、".join(missing),
+                missing_fields=missing,
             )
 
     def _gen_prefix(self) -> str:
@@ -983,7 +993,12 @@ class MaliAPIMailbox(BaseMailbox):
 
     def _ensure_api_key(self) -> None:
         if not self.api_key:
-            raise RuntimeError("MaliAPI 未配置：请在全局设置中填写 maliapi_api_key")
+            from services.mailbox_service import ProviderConfigIncompleteError
+
+            raise ProviderConfigIncompleteError(
+                "MaliAPI 未配置：请在全局设置中填写 maliapi_api_key",
+                missing_fields=["maliapi_api_key"],
+            )
 
     def _list_messages(self, account: MailboxAccount) -> list[dict]:
         data = self._request("GET", "/messages", params={"address": account.email})
@@ -1144,7 +1159,12 @@ class CFWorkerMailbox(BaseMailbox):
 
     def _ensure_api_configured(self) -> None:
         if not self.api:
-            raise RuntimeError("CF Worker API URL 未配置")
+            from services.mailbox_service import ProviderConfigIncompleteError
+
+            raise ProviderConfigIncompleteError(
+                "CF Worker API URL 未配置",
+                missing_fields=["cfworker_api_url"],
+            )
 
     def _read_json(self, response, action: str):
         try:
@@ -1182,9 +1202,23 @@ class CFWorkerMailbox(BaseMailbox):
 
         if response.status_code >= 400:
             if "private site password" in body.lower():
-                raise RuntimeError(
-                    "CFWorker API 需要私有站点密码，请配置 cfworker_custom_auth"
+                from services.mailbox_service import ProviderConfigIncompleteError
+
+                raise ProviderConfigIncompleteError(
+                    "CFWorker API 需要私有站点密码，请配置 cfworker_custom_auth",
+                    missing_fields=["cfworker_custom_auth"],
                 )
+            if 400 <= response.status_code < 500:
+                # 上游 4xx 是业务错误（domain 错、auth 错等），客户端不应 retry。
+                # 之前抛 RuntimeError 会被 FastAPI 渲染成 500，触发客户端 110s 重试浪费。
+                from services.mailbox_service import ProviderUpstreamError
+
+                raise ProviderUpstreamError(
+                    f"CFWorker API {path} 失败: HTTP {response.status_code} {preview}",
+                    upstream_status=response.status_code,
+                )
+            # 5xx 仍走 RuntimeError → 全局 handler 兜底成结构化 500，
+            # 客户端依旧按可重试 5xx 处理（覆盖真实的上游短窗抖动场景）。
             raise RuntimeError(
                 f"CFWorker API {path} 失败: HTTP {response.status_code} {preview}"
             )
@@ -1650,7 +1684,12 @@ class LuckMailMailbox(BaseMailbox):
 
     def get_email(self, *, requested_email: str = "") -> MailboxAccount:
         if not self._project_code:
-            raise RuntimeError("LuckMail 未设置 project_code，无法创建邮箱")
+            from services.mailbox_service import ProviderConfigIncompleteError
+
+            raise ProviderConfigIncompleteError(
+                "LuckMail 未设置 project_code，无法创建邮箱",
+                missing_fields=["luckmail_project_code"],
+            )
 
         if self._use_purchase_mode():
             self._log(
@@ -2034,7 +2073,12 @@ class AppleMailMailbox(BaseMailbox):
     def get_email(self, *, requested_email: str = "") -> MailboxAccount:
         global _applemail_rotation_counter
         if not self._accounts:
-            raise RuntimeError("AppleMail 未配置账号，请在邮箱设置中填入账号列表")
+            from services.mailbox_service import ProviderConfigIncompleteError
+
+            raise ProviderConfigIncompleteError(
+                "AppleMail 未配置账号，请在邮箱设置中填入账号列表",
+                missing_fields=["applemail_accounts"],
+            )
         with _applemail_rotation_lock:
             idx = _applemail_rotation_counter % len(self._accounts)
             _applemail_rotation_counter += 1

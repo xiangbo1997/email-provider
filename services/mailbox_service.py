@@ -150,11 +150,49 @@ class MailboxPollResult:
     error_code: str = ""
 
 
-class MailboxServiceError(RuntimeError):
+class MailboxServiceError(Exception):
+    """业务可识别异常基类。
+
+    重要：**不再继承 RuntimeError**。历史上 MailboxServiceError 与底层
+    各 provider 抛出的裸 RuntimeError 因继承关系错乱，使得端点的
+    ``except MailboxServiceError`` 无法 catch RuntimeError，所有底层
+    "未配置/上游错"全部以 500 + 裸 ``Internal Server Error`` 暴露。
+    现在改为继承 ``Exception``，并在 FastAPI 层用 exception_handler 统一
+    映射 4xx；裸 RuntimeError 也由全局 handler 兜底成结构化 500，
+    不再暴露 stacktrace 给客户端。
+    """
+
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class ProviderConfigIncompleteError(MailboxServiceError):
+    """422 — 必填 provider 配置字段缺失。
+
+    抛出时机：``acquire_session`` 前置校验阶段，或底层 provider 实现的
+    ``_ensure_*`` 检查发现关键字段为空时。
+    客户端处理：fail-fast，不应重试；提示用户去 admin UI 完善配置。
+    HTTP 映射：422 PROVIDER_NOT_CONFIGURED。
+    """
+
+    def __init__(self, message: str, *, missing_fields: list[str] = ()):
+        super().__init__("PROVIDER_NOT_CONFIGURED", message)
+        self.missing_fields = list(missing_fields)
+
+
+class ProviderUpstreamError(MailboxServiceError):
+    """424 — provider 上游 API 返回 4xx 业务错误（非可重试）。
+
+    抛出时机：CFWorker / SkyMail 等远端返回 400/422 等，不属于"上游短窗 5xx"。
+    客户端处理：fail-fast，不应重试，提示运维检查 provider 配置。
+    HTTP 映射：424 PROVIDER_UPSTREAM_ERROR。
+    """
+
+    def __init__(self, message: str, *, upstream_status: int = 0):
+        super().__init__("PROVIDER_UPSTREAM_ERROR", message)
+        self.upstream_status = int(upstream_status or 0)
 
 
 PROVIDER_CATALOG: dict[str, dict[str, Any]] = {
@@ -814,6 +852,15 @@ class MailboxService:
         if resolved_session_mode == SESSION_MODE_CREDENTIALED and account_override is None:
             raise MailboxServiceError("CREDENTIAL_REQUIRED", "credentialed 会话模式必须提供 existing_account")
         extra = dict(extra or {})
+        # 前置必填字段校验：消费 PROVIDER_SESSION_METADATA[*]["required_fields_by_mode"]，
+        # 在 _create_local_mailbox 之前就把"配置缺失"识别为 422，避免到了底层 provider
+        # 才抛裸 RuntimeError 被 FastAPI 渲染成 500。
+        self._check_required_fields(
+            provider=provider,
+            session_mode=resolved_session_mode,
+            extra=extra,
+            account_override=account_override,
+        )
         mailbox = self._create_local_mailbox(provider=provider, extra=extra, proxy=proxy)
 
         if account_override is None:
@@ -1028,6 +1075,74 @@ class MailboxService:
         from core.base_mailbox import create_local_mailbox
 
         return create_local_mailbox(provider=provider, extra=extra, proxy=proxy)
+
+    def _check_required_fields(
+        self,
+        *,
+        provider: str,
+        session_mode: str,
+        extra: dict[str, Any],
+        account_override: Any,
+    ) -> None:
+        """根据 PROVIDER_SESSION_METADATA[<provider>]['required_fields_by_mode']
+        做前置校验。任意必填字段为空（None / 空串 / 空集合）即抛
+        ``ProviderConfigIncompleteError``。
+
+        字段路径形态：
+        - ``some_field``：从 ``extra`` 取值
+        - ``existing_account.email``：从 ``account_override`` 直接取属性
+        - ``existing_account.credentials.client_id``：从 ``account_override.extra``
+          或 ``account_override.credentials`` 嵌套取值
+        """
+        metadata = PROVIDER_SESSION_METADATA.get(provider) or {}
+        required_by_mode = metadata.get("required_fields_by_mode") or {}
+        required = list(required_by_mode.get(session_mode) or [])
+        if not required:
+            return
+
+        missing: list[str] = []
+        for field in required:
+            if field.startswith("existing_account."):
+                if not self._existing_account_field_present(account_override, field):
+                    missing.append(field)
+                continue
+            value = extra.get(field)
+            if value is None or value == "" or value == [] or value == {}:
+                missing.append(field)
+
+        if missing:
+            raise ProviderConfigIncompleteError(
+                (
+                    f"provider={provider} session_mode={session_mode} 缺少必填字段: "
+                    f"{', '.join(missing)}。请在 admin UI 完善 provider 配置或在请求里"
+                    "通过 config_name/config_id 引用已保存的配置。"
+                ),
+                missing_fields=missing,
+            )
+
+    @staticmethod
+    def _existing_account_field_present(account_override: Any, dotted: str) -> bool:
+        """检查 ``existing_account.<path>`` 这种 dotted 字段是否在 account_override 上有非空值。"""
+        if account_override is None:
+            return False
+        # path 例：existing_account.email / existing_account.credentials.client_id
+        parts = dotted.split(".")[1:]  # 去掉 "existing_account" 前缀
+        if not parts:
+            return False
+        head, *rest = parts
+        cursor: Any = getattr(account_override, head, None)
+        # account_override 可能是 dataclass-like 或 pydantic-like：head 不存在时再尝试 extra
+        if cursor in (None, "", [], {}):
+            extra = getattr(account_override, "extra", None) or {}
+            cursor = extra.get(head) if isinstance(extra, dict) else None
+        for key in rest:
+            if cursor is None:
+                return False
+            if isinstance(cursor, dict):
+                cursor = cursor.get(key)
+            else:
+                cursor = getattr(cursor, key, None)
+        return cursor not in (None, "", [], {})
 
     def _extract_provider_meta(self, *, mailbox, account) -> dict[str, Any]:
         provider_meta: dict[str, Any] = {}
