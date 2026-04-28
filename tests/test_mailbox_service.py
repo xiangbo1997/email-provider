@@ -288,5 +288,71 @@ class MailboxServiceTests(unittest.TestCase):
         self.assertTrue(any(item["email"] == "known@example.com" for item in poll_mailbox._accounts))
 
 
+class ExistingAccountFieldPresentTests(unittest.TestCase):
+    """``MailboxService._existing_account_field_present`` dotted-path 解析行为。
+
+    背景：``api/mailbox_service.py:_build_account_override_from_existing_account``
+    会把 ``ExistingAccount.credentials.X`` 摊平到 ``MailboxAccount.extra["X"]``。
+    PROVIDER_SESSION_METADATA 里 applemail credentialed 模式声明的字段路径却是
+    嵌套形态 ``existing_account.credentials.client_id``，所以解析逻辑必须能
+    跨这层模型不一致。
+    """
+
+    def setUp(self):
+        # 直接调用静态方法，无需 DB / 网络
+        self._fn = mailbox_service._existing_account_field_present
+
+    def test_email_attribute_path_present(self):
+        # case 3：existing_account.email 直接挂在 MailboxAccount 上 → 走属性路径
+        ao = MailboxAccount(email="x@y.c", account_id="", extra={})
+        self.assertTrue(self._fn(ao, "existing_account.email"))
+
+    def test_email_attribute_path_empty(self):
+        ao = MailboxAccount(email="", account_id="", extra={})
+        self.assertFalse(self._fn(ao, "existing_account.email"))
+
+    def test_account_id_attribute_empty_extra_fallback(self):
+        # case 4：account_id 属性为空时走 extra[head] fallback（保持原有 fallback 路径）
+        ao = MailboxAccount(email="x@y.c", account_id="", extra={"account_id": "xyz"})
+        self.assertTrue(self._fn(ao, "existing_account.account_id"))
+
+    def test_credentials_flat_extra_present(self):
+        # case 1：credentials.client_id 摊平到 extra["client_id"] → 第 3 层 fallback 命中
+        ao = MailboxAccount(
+            email="x@y.c",
+            account_id="",
+            extra={"client_id": "abc", "refresh_token": "rt"},
+        )
+        self.assertTrue(self._fn(ao, "existing_account.credentials.client_id"))
+        self.assertTrue(self._fn(ao, "existing_account.credentials.refresh_token"))
+
+    def test_credentials_flat_extra_empty(self):
+        # case 2：摊平 key 存在但值为空 → False
+        ao = MailboxAccount(
+            email="x@y.c",
+            account_id="",
+            extra={"client_id": "", "refresh_token": ""},
+        )
+        self.assertFalse(self._fn(ao, "existing_account.credentials.client_id"))
+        self.assertFalse(self._fn(ao, "existing_account.credentials.refresh_token"))
+
+    def test_credentials_flat_extra_missing_key(self):
+        # case 2 变体：extra 完全没有摊平 key → False（不会与其他字段误匹配）
+        ao = MailboxAccount(email="x@y.c", account_id="", extra={"unrelated": "v"})
+        self.assertFalse(self._fn(ao, "existing_account.credentials.client_id"))
+
+    def test_nested_extra_dict_still_works(self):
+        # 第 2 层 fallback：head 直接是 extra 顶层 dict 形态（旧约定，保持向后兼容）
+        ao = MailboxAccount(
+            email="x@y.c",
+            account_id="",
+            extra={"credentials": {"client_id": "nested-abc"}},
+        )
+        self.assertTrue(self._fn(ao, "existing_account.credentials.client_id"))
+
+    def test_account_override_none_returns_false(self):
+        self.assertFalse(self._fn(None, "existing_account.email"))
+
+
 if __name__ == "__main__":
     unittest.main()

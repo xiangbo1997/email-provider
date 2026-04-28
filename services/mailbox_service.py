@@ -1122,7 +1122,31 @@ class MailboxService:
 
     @staticmethod
     def _existing_account_field_present(account_override: Any, dotted: str) -> bool:
-        """检查 ``existing_account.<path>`` 这种 dotted 字段是否在 account_override 上有非空值。"""
+        """检查 ``existing_account.<path>`` 这种 dotted 字段是否在 account_override 上有非空值。
+
+        解析顺序（按声明路径 ``existing_account.<head>.<...rest>``）：
+
+        1. **属性路径**：``getattr(account_override, head)`` 若拿到非空值，就沿
+           ``rest`` 继续走（dict 用 ``.get``、对象用 ``getattr``）。覆盖 ``email``
+           / ``account_id`` 等直接挂在 ``MailboxAccount`` 上的字段。
+
+        2. **extra 嵌套路径**：head 在属性上为空时，回退到
+           ``account_override.extra[head]``，再沿 ``rest`` 继续。覆盖那种"子结构
+           被原样塞进 extra"的形态。
+
+        3. **extra 摊平路径**（本次新增）：如果嵌套路径仍空且 ``rest`` 至少有一段，
+           就尝试把 ``rest[0]`` 直接当 ``extra`` 顶层 key 查找。这一条对应
+           ``api/mailbox_service.py:_build_account_override_from_existing_account``
+           的转换约定 -- 它把 ``ExistingAccount.credentials.client_id`` 摊平到
+           ``MailboxAccount.extra["client_id"]``，所以声明路径
+           ``existing_account.credentials.client_id`` 必须能在摊平后的 extra 顶层
+           解析到 ``client_id``。命中即返回 True，不再继续 rest 遍历。
+
+        三层退化设计的目的：让 ``PROVIDER_SESSION_METADATA`` 的字段路径声明保持
+        与 Pydantic 请求 schema（``ExistingAccount.credentials.X``）一致，同时
+        兼容下游 ``_build_account_override`` 已固化多年的"摊平 credentials 到
+        extra 顶层"约定，无需联动改 metadata 或下游业务代码。
+        """
         if account_override is None:
             return False
         # path 例：existing_account.email / existing_account.credentials.client_id
@@ -1131,10 +1155,19 @@ class MailboxService:
             return False
         head, *rest = parts
         cursor: Any = getattr(account_override, head, None)
-        # account_override 可能是 dataclass-like 或 pydantic-like：head 不存在时再尝试 extra
+        # 第 2 层：head 不在属性上时回退到 extra[head]
         if cursor in (None, "", [], {}):
             extra = getattr(account_override, "extra", None) or {}
-            cursor = extra.get(head) if isinstance(extra, dict) else None
+            extra_dict = extra if isinstance(extra, dict) else {}
+            cursor = extra_dict.get(head)
+            # 第 3 层：head 是 "credentials" 这种摊平容器名 -- 嵌套查不到时
+            # 直接用 rest[0] 到 extra 顶层找，对应 _build_account_override
+            # 的摊平约定（credentials.X → extra["X"]）。命中即结束，
+            # 不再继续 rest 遍历，避免误把摊平值再当 dict 套一层。
+            if cursor in (None, "", [], {}) and rest:
+                flat_value = extra_dict.get(rest[0])
+                if flat_value not in (None, "", [], {}):
+                    return True
         for key in rest:
             if cursor is None:
                 return False
