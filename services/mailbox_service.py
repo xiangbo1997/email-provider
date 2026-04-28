@@ -807,6 +807,7 @@ class MailboxService:
         purpose: str = "generic",
         account_override: Any = None,
         lease_seconds: int = 900,
+        requested_email: str = "",
     ) -> MailboxLease:
         self.validate_provider(provider)
         resolved_session_mode = self.normalize_session_mode(provider, session_mode)
@@ -816,7 +817,7 @@ class MailboxService:
         mailbox = self._create_local_mailbox(provider=provider, extra=extra, proxy=proxy)
 
         if account_override is None:
-            account = mailbox.get_email()
+            account = mailbox.get_email(requested_email=requested_email)
             try:
                 before_ids = sorted(str(item) for item in (mailbox.get_current_ids(account) or set()) if str(item))
             except Exception:

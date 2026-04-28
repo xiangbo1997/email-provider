@@ -29,7 +29,7 @@ class BaseMailbox(ABC):
             log_fn(message)
 
     @abstractmethod
-    def get_email(self) -> MailboxAccount:
+    def get_email(self, *, requested_email: str = "") -> MailboxAccount:
         """获取一个可用邮箱"""
         ...
 
@@ -193,7 +193,7 @@ class MailboxServiceBackedMailbox(BaseMailbox):
         )
         self._remember_lease(updated)
 
-    def get_email(self) -> MailboxAccount:
+    def get_email(self, *, requested_email: str = "") -> MailboxAccount:
         lease = self._remember_lease(
             self._service().acquire_session(
                 provider=self._provider,
@@ -364,7 +364,7 @@ class LaoudoMailbox(BaseMailbox):
         self.api = "https://laoudo.com/api/email"
         self._ua = "Mozilla/5.0"
 
-    def get_email(self) -> MailboxAccount:
+    def get_email(self, *, requested_email: str = "") -> MailboxAccount:
         if not self._email:
             raise RuntimeError(
                 "Laoudo 邮箱未配置或已失效，请检查 laoudo_auth、laoudo_email、laoudo_account_id 配置，"
@@ -462,7 +462,7 @@ class AitreMailbox(BaseMailbox):
         self._email = email
         self.api = "https://mail.aitre.cc/api/tempmail"
 
-    def get_email(self) -> MailboxAccount:
+    def get_email(self, *, requested_email: str = "") -> MailboxAccount:
         return MailboxAccount(email=self._email)
 
     def get_current_ids(self, account: MailboxAccount) -> set:
@@ -531,7 +531,7 @@ class TempMailLolMailbox(BaseMailbox):
         self._token = None
         self._email = None
 
-    def get_email(self) -> MailboxAccount:
+    def get_email(self, *, requested_email: str = "") -> MailboxAccount:
         import requests
 
         r = requests.post(
@@ -642,7 +642,7 @@ class SkyMailMailbox(BaseMailbox):
         chars = string.ascii_lowercase + string.digits
         return "".join(random.choice(chars) for _ in range(length))
 
-    def get_email(self) -> MailboxAccount:
+    def get_email(self, *, requested_email: str = "") -> MailboxAccount:
         import requests
 
         self._ensure_config()
@@ -820,7 +820,7 @@ class DuckMailMailbox(BaseMailbox):
         )
         return r
 
-    def get_email(self) -> MailboxAccount:
+    def get_email(self, *, requested_email: str = "") -> MailboxAccount:
         import random, string
 
         username = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
@@ -999,7 +999,7 @@ class MaliAPIMailbox(BaseMailbox):
             return data["message"]
         return data if isinstance(data, dict) else {}
 
-    def get_email(self) -> MailboxAccount:
+    def get_email(self, *, requested_email: str = "") -> MailboxAccount:
         self._ensure_api_key()
         body = {}
         if self.domain:
@@ -1253,17 +1253,45 @@ class CFWorkerMailbox(BaseMailbox):
             return random.choice(self.enabled_domains)
         return self.domain
 
-    def get_email(self) -> MailboxAccount:
+    def get_email(self, *, requested_email: str = "") -> MailboxAccount:
         self._ensure_api_configured()
-        name = self._generate_local_part()
-        payload = {"enablePrefix": True, "name": name}
-        selected_domain = self._pick_domain()
-        if selected_domain:
-            payload["domain"] = selected_domain
-            self._log(f"[CFWorker] 本次使用域名: {selected_domain}")
-        data = self._request_json(
-            "POST", "/admin/new_address", payload=payload, timeout=15
-        )
+        if requested_email and "@" in requested_email:
+            # 模式 B：用户指定邮箱 → fixed-name + 指定 domain，不加随机前缀
+            local, _, raw_domain = requested_email.partition("@")
+            name = local.strip().lower()
+            selected_domain = raw_domain.strip().lower()
+            payload = {"enablePrefix": False, "name": name, "domain": selected_domain}
+            self._log(f"[CFWorker] 使用用户指定邮箱: {requested_email}")
+        else:
+            # 模式 A：原有自动分配
+            name = self._generate_local_part()
+            payload = {"enablePrefix": True, "name": name}
+            selected_domain = self._pick_domain()
+            if selected_domain:
+                payload["domain"] = selected_domain
+                self._log(f"[CFWorker] 本次使用域名: {selected_domain}")
+        try:
+            data = self._request_json(
+                "POST", "/admin/new_address", payload=payload, timeout=15
+            )
+        except RuntimeError as exc:
+            # 地址已存在 → 复用：admin 模式下 wait_for_code 走 /admin/mails 拉邮件无需 mailbox JWT
+            if "Address already exists" in str(exc):
+                reused_email = (
+                    requested_email.strip().lower()
+                    if requested_email and "@" in requested_email
+                    else (f"{name}@{selected_domain}" if selected_domain else "")
+                )
+                if not reused_email:
+                    raise
+                self._log(f"[CFWorker] 地址已存在，复用现有邮箱: {reused_email}")
+                self._token = ""
+                return MailboxAccount(
+                    email=reused_email,
+                    account_id="",
+                    extra={"cfworker_domain": selected_domain, "reused": True} if selected_domain else {"reused": True},
+                )
+            raise
         email = data.get("email", data.get("address", ""))
         token = data.get("token", data.get("jwt", ""))
         if not email or not token:
@@ -1310,7 +1338,15 @@ class CFWorkerMailbox(BaseMailbox):
         import time
         from datetime import datetime, timezone
 
-        seen = set(before_ids or [])
+        # 复用模式（reused=True）下：邮箱专为这次注册创建/复用，所有 OpenAI 邮件都相关，
+        # 不应该把 acquire 时已存在的 mail id 当成"旧邮件"跳过 —— 否则 acquire 与邮件到达
+        # 之间的微小时序差会让刚到的验证码被错误过滤。改用 otp_cutoff（时间窗口）做过滤即可。
+        is_reused = bool((account.extra or {}).get("reused")) if account else False
+        if is_reused:
+            seen = set()
+            self._log(f"[CFWorker] 复用邮箱 {account.email}，忽略 before_ids 全量扫描邮件")
+        else:
+            seen = set(before_ids or [])
         exclude_codes = set(kwargs.get("exclude_codes") or [])
         otp_sent_at = kwargs.get("otp_sent_at")
         otp_cutoff = float(otp_sent_at) - 2 if otp_sent_at else None
@@ -1420,7 +1456,7 @@ class MoeMailMailbox(BaseMailbox):
         print(f"[MoeMail] 登录失败，cookies: {[c.name for c in s.cookies]}")
         return ""
 
-    def get_email(self) -> MailboxAccount:
+    def get_email(self, *, requested_email: str = "") -> MailboxAccount:
         # 每次调用都重新注册新账号，保证邮箱唯一
         self._session_token = None
         self._register_and_login()
@@ -1612,7 +1648,7 @@ class LuckMailMailbox(BaseMailbox):
                 return code
         return None
 
-    def get_email(self) -> MailboxAccount:
+    def get_email(self, *, requested_email: str = "") -> MailboxAccount:
         if not self._project_code:
             raise RuntimeError("LuckMail 未设置 project_code，无法创建邮箱")
 
@@ -1812,7 +1848,7 @@ class FreemailMailbox(BaseMailbox):
         self._session = s
         return s
 
-    def get_email(self) -> MailboxAccount:
+    def get_email(self, *, requested_email: str = "") -> MailboxAccount:
         if not self._session:
             self._get_session()
         import requests
@@ -1915,7 +1951,7 @@ class QQEmailMailbox(BaseMailbox):
             raise RuntimeError("QQEmail 登录失败，请检查 qqemail_username / qqemail_password 配置")
         self._session = s
 
-    def get_email(self) -> MailboxAccount:
+    def get_email(self, *, requested_email: str = "") -> MailboxAccount:
         import random
         import string
         self._ensure_session()
@@ -1995,7 +2031,7 @@ class AppleMailMailbox(BaseMailbox):
                 })
         self._selected: dict = {}
 
-    def get_email(self) -> MailboxAccount:
+    def get_email(self, *, requested_email: str = "") -> MailboxAccount:
         global _applemail_rotation_counter
         if not self._accounts:
             raise RuntimeError("AppleMail 未配置账号，请在邮箱设置中填入账号列表")

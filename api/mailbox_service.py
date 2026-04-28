@@ -48,7 +48,8 @@ class ExistingAccount(BaseModel):
 
 
 class ManagedMailboxSessionRequest(BaseMailboxSessionRequest):
-    pass
+    # 新增可选 email 字段：用户指定 → fixed-name 创建邮箱；留空 → 自动分配
+    email: str | None = None
 
 
 class CredentialedMailboxSessionRequest(BaseMailboxSessionRequest):
@@ -262,6 +263,7 @@ def create_managed_mailbox_session(body: ManagedMailboxSessionRequest):
             proxy=runtime["proxy"],
             purpose=body.purpose,
             lease_seconds=body.lease_seconds,
+            requested_email=str(body.email or "").strip(),
         )
     except MailboxServiceError as exc:
         _raise_http(exc)
